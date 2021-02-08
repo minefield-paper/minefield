@@ -1,0 +1,2988 @@
+From 44b47ab32cde9ed025a80c30de3ea2f067191f2c Mon Sep 17 00:00:00 2001
+From: Minefiled <minefield@minefield.minefield>
+Date: Thu, 3 Dec 2020 11:53:54 +0100
+Subject: [PATCH 1/5] base
+
+---
+ llvm/lib/Target/X86/CMakeLists.txt            |   1 +
+ llvm/lib/Target/X86/X86.h                     |   2 +
+ llvm/lib/Target/X86/X86FaultHardeningPass.cpp | 421 ++++++++++++++++++
+ llvm/lib/Target/X86/X86RegisterInfo.cpp       |   5 +
+ llvm/lib/Target/X86/X86TargetMachine.cpp      |   2 +
+ 5 files changed, 431 insertions(+)
+ create mode 100644 llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+
+diff --git a/llvm/lib/Target/X86/CMakeLists.txt b/llvm/lib/Target/X86/CMakeLists.txt
+index 729934b29..b3f0e1860 100644
+--- a/llvm/lib/Target/X86/CMakeLists.txt
++++ b/llvm/lib/Target/X86/CMakeLists.txt
+@@ -74,6 +74,7 @@ set(sources
+   X86WinAllocaExpander.cpp
+   X86WinEHState.cpp
+   X86InsertWait.cpp
++  X86FaultHardeningPass.cpp
+   )
+ 
+ add_llvm_target(X86CodeGen ${sources})
+diff --git a/llvm/lib/Target/X86/X86.h b/llvm/lib/Target/X86/X86.h
+index 91ba4e3d0..2c69c1609 100644
+--- a/llvm/lib/Target/X86/X86.h
++++ b/llvm/lib/Target/X86/X86.h
+@@ -144,6 +144,7 @@ FunctionPass *createX86LoadValueInjectionLoadHardeningPass();
+ FunctionPass *createX86LoadValueInjectionRetHardeningPass();
+ FunctionPass *createX86SpeculativeLoadHardeningPass();
+ FunctionPass *createX86SpeculativeExecutionSideEffectSuppression();
++FunctionPass *createX86FaultHardeningPass();
+ 
+ void initializeEvexToVexInstPassPass(PassRegistry &);
+ void initializeFixupBWInstPassPass(PassRegistry &);
+@@ -166,6 +167,7 @@ void initializeX86OptimizeLEAPassPass(PassRegistry &);
+ void initializeX86PartialReductionPass(PassRegistry &);
+ void initializeX86SpeculativeLoadHardeningPassPass(PassRegistry &);
+ void initializeX86SpeculativeExecutionSideEffectSuppressionPass(PassRegistry &);
++void initializeX86FaultHardeningPass(PassRegistry &);
+ 
+ namespace X86AS {
+ enum : unsigned {
+diff --git a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+new file mode 100644
+index 000000000..be7576441
+--- /dev/null
++++ b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+@@ -0,0 +1,421 @@
++//===- Hello.cpp - Example code from "Writing an LLVM Pass" ---------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements two versions of the LLVM "Hello World" pass described
++// in docs/WritingAnLLVMPass.html
++//
++//===----------------------------------------------------------------------===//
++#include "X86.h"
++#include "X86InstrBuilder.h"
++#include "X86Subtarget.h"
++
++#include "llvm/ADT/Statistic.h"
++#include "llvm/CodeGen/MachineConstantPool.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/Format.h"
++#include "llvm/Support/RandomNumberGenerator.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <string>
++#include <tuple>
++
++#define NAME       "fault-hardening"
++#define DEBUG_TYPE NAME
++
++using namespace llvm;
++
++#define MIB_ADD_MEM_CONSTANT(_index)               \
++    addReg(X86::RIP)                  /*base*/     \
++        .addImm(1)                    /*scale*/    \
++        .addReg(X86::NoRegister)      /*index*/    \
++        .addConstantPoolIndex(_index) /*constant*/ \
++        .addReg(X86::NoRegister)      /*segment*/
++
++#define MIB_ADD_MEM_SYMBOL(_symbol)            \
++    addReg(X86::RIP)                /*base*/   \
++        .addImm(1)                  /*scale*/  \
++        .addReg(X86::NoRegister)    /*index*/  \
++        .addExternalSymbol(_symbol) /*symbol*/ \
++        .addReg(X86::NoRegister)    /*segment*/
++
++namespace {
++
++enum class FaultTrapType : int { IMUL, SHL };
++
++// Commandline Options
++
++static cl::opt<bool> cl_enabled("fh-enable", cl::NotHidden, cl::desc(NAME ": enable fault hardening"), cl::init(false));
++
++static cl::opt<bool> cl_mask("fh-mask", cl::NotHidden, cl::desc(NAME ": monitor fault mask"), cl::init(false));
++
++static cl::opt<bool> cl_place_ud("fh-ud", cl::NotHidden, cl::desc(NAME ": place ud trap"), cl::init(false));
++
++static cl::opt<std::string> cl_percentage("fh-percentage", cl::NotHidden, cl::desc(NAME ": trap generation percentage"),
++                                          cl::init("100"));
++
++static cl::opt<FaultTrapType> cl_trap(
++    cl::desc("Choose trap type:"),
++    cl::values(cl::OptionEnumValue { "fh-trap-imul", static_cast<int>(FaultTrapType::IMUL), NAME ": trap type IMUL" },
++               cl::OptionEnumValue { "fh-trap-shl", static_cast<int>(FaultTrapType::SHL), NAME ": trap type SHL" }),
++    cl::init(FaultTrapType::IMUL));
++
++// STATISTIC(HelloCounter, "Counts number of functions greeted");
++
++class FaultHardener {
++    Register REG;
++
++    uint64_t m_init;
++    uint64_t m_factor;
++
++    FaultTrapType m_trap_type;
++
++    MachineFunction &MF;
++
++    X86Subtarget const &   STI;
++    X86RegisterInfo const &TRI;
++    X86InstrInfo const &   TII;
++
++    unsigned m_constant_init;
++    unsigned m_constant_factor;
++
++    uint64_t m_REG_value;
++
++    std::string m_place_percentage;
++
++    void place_init_state(MachineBasicBlock &MBB, MachineBasicBlock::instr_iterator MI);
++    void place_trap(MachineBasicBlock::instr_iterator MI);
++    void place_check(MachineFunction::iterator &MBBI, MachineBasicBlock::instr_iterator &MI, bool before);
++
++    std::pair<MachineBasicBlock *, MachineBasicBlock *> generate_if(unsigned cond, MachineBasicBlock::instr_iterator MI,
++                                                                    bool before);
++
++    unsigned generateConstant(uint64_t constant) {
++        IntegerType *type  = IntegerType::getInt64Ty(MF.getFunction().getContext());
++        Constant *   value = ConstantInt::get(type, constant, false);
++        return MF.getConstantPool()->getConstantPoolIndex(value, {});
++    }
++
++  public:
++    FaultHardener(MachineFunction &MF)
++      : REG { X86::R11 }
++      , m_trap_type { cl_trap.getValue() }
++      , MF { MF }
++      , STI { MF.getSubtarget<X86Subtarget>() }
++      , TRI { *STI.getRegisterInfo() }
++      , TII { *STI.getInstrInfo() }
++      , m_REG_value { 0 }
++      , m_place_percentage { cl_percentage.getValue() } //
++    {
++        switch ( m_trap_type ) {
++            case FaultTrapType::IMUL: {
++                m_init   = 0x5555555555555555ull;
++                m_factor = 0x11;
++                break;
++            }
++            case FaultTrapType::SHL: {
++                m_init   = 5;
++                m_factor = 0x0205070302060507ull;
++                break;
++            }
++        }
++        m_constant_init   = generateConstant(m_init);
++        m_constant_factor = generateConstant(m_factor);
++    }
++
++    void harden_machine_function();
++};
++
++struct X86FaultHardening : public MachineFunctionPass {
++    static char ID;
++
++    X86FaultHardening()
++      : MachineFunctionPass(ID) {
++    }
++
++    bool runOnMachineFunction(MachineFunction &MF) override {
++        if ( !cl_enabled ) {
++            return false;
++        }
++        FaultHardener { MF }.harden_machine_function();
++
++        return true;
++    }
++
++    virtual ~X86FaultHardening() {
++    }
++};
++char X86FaultHardening::ID = 0;
++
++} // namespace
++
++INITIALIZE_PASS(X86FaultHardening, NAME, "X86 Fault Hardening Pass", false, false)
++
++FunctionPass *llvm::createX86FaultHardeningPass() {
++    return new X86FaultHardening();
++}
++
++// Implementation
++
++namespace {
++
++// copied from cmove placement
++static bool eflags_in_use(MachineBasicBlock::instr_iterator MI) {
++    if ( MI->killsRegister(X86::EFLAGS) )
++        return true;
++
++    // The EFLAGS operand of MI might be missing a kill marker.
++    // Figure out whether EFLAGS operand should LIVE after MI instruction.
++    MachineBasicBlock *         BB    = MI->getParent();
++    MachineBasicBlock::iterator ItrMI = MI;
++
++    // Scan forward through BB for a use/def of EFLAGS.
++    for ( auto I = ItrMI, E = BB->end(); I != E; ++I ) {
++        if ( I->readsRegister(X86::EFLAGS) )
++            return true;
++        if ( I->definesRegister(X86::EFLAGS) )
++            return false;
++    }
++
++    // We hit the end of the block, check whether EFLAGS is live into a
++    // successor.
++    for ( auto I = BB->succ_begin(), E = BB->succ_end(); I != E; ++I ) {
++        if ( (*I)->isLiveIn(X86::EFLAGS) )
++            return true;
++    }
++
++    return false;
++}
++
++void FaultHardener::harden_machine_function() {
++    if ( !STI.is64Bit() ) {
++        return;
++    }
++
++    bool print = false;
++
++    for ( auto MBBI = MF.begin(); MBBI != MF.end(); ++MBBI ) {
++
++        bool place_init = true;
++
++        for ( auto MI = MBBI->instr_begin(); MI != MBBI->instr_end(); ++MI ) {
++            if ( MI->isMetaInstruction() ) {
++                continue;
++            }
++
++            if ( MI->getOpcode() == X86::SHL64ri ) {
++                // print = true;
++            }
++
++            if ( place_init ) {
++                place_init_state(*MBBI, MI);
++                place_init = false;
++            }
++
++            if ( !eflags_in_use(MI) ) {
++                place_trap(MI);
++            }
++
++            // if return pop also reg
++            if ( MI->isReturn() || MI->isBranch() ) {
++                place_check(MBBI, MI, true);
++            }
++            else if ( MI->isCall() ) {
++                place_check(MBBI, MI, true);
++                place_init = true;
++            }
++            // place check at the end
++            else if ( std::next(MI) == MBBI->instr_end() ) {
++                place_check(MBBI, MI, false);
++                break;
++            }
++
++            if ( MI == MBBI->instr_end() ) {
++                break;
++            }
++        }
++    }
++    if ( print ) {
++        for ( auto MBBI = MF.begin(); MBBI != MF.end(); ++MBBI ) {
++            for ( auto MI = MBBI->instr_begin(); MI != MBBI->instr_end(); ++MI ) {
++                MI->print(errs());
++                errs() << "\n";
++            }
++        }
++    }
++}
++
++#define USE_AES 0
++
++void FaultHardener::place_init_state(MachineBasicBlock &MBB, MachineBasicBlock::instr_iterator MI) {
++
++    BuildMI(MBB, MI, DebugLoc {}, TII.get(X86::MOV64rm))
++        .addReg(REG)                            // dst
++        .MIB_ADD_MEM_CONSTANT(m_constant_init); // src
++
++    m_REG_value = m_init;
++}
++
++void FaultHardener::place_trap(MachineBasicBlock::instr_iterator MI) {
++
++    switch ( m_trap_type ) {
++        case FaultTrapType::IMUL: {
++            BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::IMUL64rm))
++                .addReg(REG)                              // output = x * y
++                .addReg(REG)                              // x
++                .MIB_ADD_MEM_CONSTANT(m_constant_factor); // y
++            m_REG_value *= m_factor;
++            break;
++        }
++        case FaultTrapType::SHL: {
++            uint8_t r;
++            if ( getRandomBytes(&r, sizeof(r)) ) {
++                errs() << "can't get random number!\n";
++            }
++
++            uint64_t before = m_REG_value;
++
++            if ( r < 128 ) {
++                BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::SHRX64rm))
++                    .addReg(REG)                             // output = x << y
++                    .MIB_ADD_MEM_CONSTANT(m_constant_factor) // x
++                    .addReg(REG);                            // y
++
++                uint64_t shift  = m_REG_value & 0x3f;
++                uint64_t result = m_factor >> shift;
++                m_REG_value     = result;
++
++                errs() << format("0x%16lx = 0x%16lx >> %ld -> 0x%16lx\n", result, m_factor, shift,
++                                 before ^ m_REG_value);
++            }
++            else {
++                BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::SHLX64rm))
++                    .addReg(REG)                             // output = x << y
++                    .MIB_ADD_MEM_CONSTANT(m_constant_factor) // x
++                    .addReg(REG);                            // y
++
++                uint64_t shift  = m_REG_value & 0x3f;
++                uint64_t result = m_factor << shift;
++                m_REG_value     = result;
++
++                errs() << format("0x%16lx = 0x%16lx << %ld -> 0x%16lx\n", result, m_factor, shift,
++                                 before ^ m_REG_value);
++            }
++
++            break;
++        }
++    }
++
++    if ( cl_mask ) {
++
++        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::XOR64rm))
++            .addReg(REG)                                          // output = x ^ y
++            .addReg(REG)                                          // x
++            .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
++
++        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::OR64mr))
++            .MIB_ADD_MEM_SYMBOL("__fault_mask") // out |= in
++            .addReg(REG);                       // in
++
++        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::POPCNT64rr))
++            .addReg(REG)  // out = popcount(in)
++            .addReg(REG); // in
++
++        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::ADD64mr))
++            .MIB_ADD_MEM_SYMBOL("__fault_count") // output += x
++            .addReg(REG);                        // x
++
++        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::MOV64rm))
++            .addReg(REG)                                          // out = in
++            .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // in
++    }
++}
++
++void FaultHardener::place_check(MachineFunction::iterator &MBBI, MachineBasicBlock::instr_iterator &MI, bool before) {
++    if ( cl_mask ) {
++        // MI = std::next(MI);
++        // place_init_state(*MBBI, MI);
++        return;
++    }
++    MachineBasicBlock &MBB         = *MBBI;
++    DebugLoc           DL          = MI->getDebugLoc();
++    bool               eflags_used = eflags_in_use(MI);
++
++    MachineBasicBlock::instr_iterator where = before ? MI : std::next(MI);
++
++    if ( eflags_used ) {
++        BuildMI(MBB, where, DL, TII.get(X86::PUSHF64));
++    }
++
++    BuildMI(MBB, where, DL, TII.get(X86::CMP64rm))
++        .addReg(REG)                                          // x
++        .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
++
++    auto blocks   = generate_if(X86::COND_E, MI, before);
++    auto ThenMBB  = blocks.first;
++    auto AfterMBB = blocks.second;
++
++    // call
++    // BuildMI(TakenMBB, DL, TII.get(X86::CALL64pcrel32))
++    //    .addExternalSymbol("__abort"); // target
++
++    if ( cl_place_ud ) {
++        BuildMI(ThenMBB, DL, TII.get(X86::TRAP));
++    }
++    else {
++        BuildMI(ThenMBB, DL, TII.get(X86::INC64m)).MIB_ADD_MEM_SYMBOL("__fault_count"); // target
++    }
++    // BuildMI(ThenMBB, DL, TII.get(X86::JMP_1)).addMBB(AfterMBB);
++
++    MI = AfterMBB->instr_begin();
++
++    if ( eflags_used ) {
++        BuildMI(*AfterMBB, MI, DL, TII.get(X86::POPF64));
++    }
++    // place_init_state(*AfterMBB, MI);
++    MBBI = AfterMBB->getIterator();
++}
++
++std::pair<MachineBasicBlock *, MachineBasicBlock *>
++    FaultHardener::generate_if(unsigned cond, MachineBasicBlock::instr_iterator MI, bool before) {
++
++    // generate:
++    // if (cond) {
++    //    then
++    // }
++    // after
++
++    MachineBasicBlock *       MBB = MI->getParent();
++    MachineFunction *         F   = MBB->getParent();
++    MachineFunction::iterator it  = ++(MBB->getIterator());
++
++    MachineBasicBlock *ThenMBB  = F->CreateMachineBasicBlock(MBB->getBasicBlock());
++    MachineBasicBlock *AfterMBB = F->CreateMachineBasicBlock(MBB->getBasicBlock());
++
++    F->insert(it, ThenMBB);
++    F->insert(it, AfterMBB);
++
++    MachineBasicBlock::instr_iterator split = before ? MI : std::next(MI);
++
++    AfterMBB->splice(AfterMBB->begin(), MBB, split, MBB->end());
++    AfterMBB->transferSuccessorsAndUpdatePHIs(MBB);
++
++    MBB->addSuccessor(AfterMBB);
++    MBB->addSuccessor(ThenMBB);
++
++    ThenMBB->addSuccessor(AfterMBB);
++
++    // jump
++    BuildMI(MBB, MI->getDebugLoc(), TII.get(X86::JCC_1))
++        .addMBB(AfterMBB) // target
++        .addImm(cond);    // type
++
++    return std::make_pair(ThenMBB, AfterMBB);
++}
++
++} // namespace
+\ No newline at end of file
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index f456728cf..7616c778e 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -596,6 +596,11 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+     }
+   }
+ 
++  for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R11) )
++      Reserved.set(SubReg);
++  // for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R15) )
++  //    Reserved.set(SubReg);
++
+   assert(checkAllSuperRegsMarked(Reserved,
+                                  {X86::SIL, X86::DIL, X86::BPL, X86::SPL,
+                                   X86::SIH, X86::DIH, X86::BPH, X86::SPH}));
+diff --git a/llvm/lib/Target/X86/X86TargetMachine.cpp b/llvm/lib/Target/X86/X86TargetMachine.cpp
+index 7344116e1..b250aa31a 100644
+--- a/llvm/lib/Target/X86/X86TargetMachine.cpp
++++ b/llvm/lib/Target/X86/X86TargetMachine.cpp
+@@ -89,6 +89,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeX86Target() {
+   initializeX86LoadValueInjectionRetHardeningPassPass(PR);
+   initializeX86OptimizeLEAPassPass(PR);
+   initializeX86PartialReductionPass(PR);
++  initializeX86FaultHardeningPass(PR);
+ }
+ 
+ static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
+@@ -552,6 +553,7 @@ void X86PassConfig::addPreEmitPass2() {
+   if (TT.isOSWindows())
+     addPass(createCFGuardLongjmpPass());
+   addPass(createX86LoadValueInjectionRetHardeningPass());
++  addPass(createX86FaultHardeningPass());
+ }
+ 
+ std::unique_ptr<CSEConfigBase> X86PassConfig::getCSEConfig() const {
+-- 
+2.25.1
+
+
+From 284b139952410a995c8a4ffac1f8637b9e281162 Mon Sep 17 00:00:00 2001
+From: minefield <minefield@minefield.minefield>
+Date: Fri, 22 Jan 2021 02:30:48 +0100
+Subject: [PATCH 2/5] ..
+
+---
+ llvm/lib/MC/ELFObjectWriter.cpp               |   6 +-
+ llvm/lib/Target/X86/X86FaultHardeningPass.cpp | 347 +++++++++++++++---
+ llvm/lib/Target/X86/X86RegisterInfo.cpp       |   2 +-
+ 3 files changed, 303 insertions(+), 52 deletions(-)
+
+diff --git a/llvm/lib/MC/ELFObjectWriter.cpp b/llvm/lib/MC/ELFObjectWriter.cpp
+index 1ca9d0fe1..ed46d0458 100644
+--- a/llvm/lib/MC/ELFObjectWriter.cpp
++++ b/llvm/lib/MC/ELFObjectWriter.cpp
+@@ -638,10 +638,10 @@ void ELFWriter::computeSymbolTable(
+     if (!isInSymtab(Layout, Symbol, Used || WeakrefUsed || isSignature,
+                     OWriter.Renames.count(&Symbol)))
+       continue;
+-
++    // llvm::errs() << Symbol.getName() << '\n';
+     if (Symbol.isTemporary() && Symbol.isUndefined()) {
+-      Ctx.reportError(SMLoc(), "Undefined temporary symbol " + Symbol.getName());
+-      continue;
++        // Ctx.reportError(SMLoc(), "Undefined temporary symbol " + Symbol.getName());
++        continue;
+     }
+ 
+     ELFSymbolData MSD;
+diff --git a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+index be7576441..367eaf6d1 100644
+--- a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
++++ b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+@@ -52,12 +52,15 @@ enum class FaultTrapType : int { IMUL, SHL };
+ 
+ static cl::opt<bool> cl_enabled("fh-enable", cl::NotHidden, cl::desc(NAME ": enable fault hardening"), cl::init(false));
+ 
++static cl::opt<bool> cl_inplace("fh-inplace-check", cl::NotHidden, cl::desc(NAME ": check faults inplace"),
++                                cl::init(false));
++
+ static cl::opt<bool> cl_mask("fh-mask", cl::NotHidden, cl::desc(NAME ": monitor fault mask"), cl::init(false));
+ 
+ static cl::opt<bool> cl_place_ud("fh-ud", cl::NotHidden, cl::desc(NAME ": place ud trap"), cl::init(false));
+ 
+-static cl::opt<std::string> cl_percentage("fh-percentage", cl::NotHidden, cl::desc(NAME ": trap generation percentage"),
+-                                          cl::init("100"));
++static cl::opt<uint32_t> cl_percentage("fh-percentage", cl::NotHidden, cl::desc(NAME ": trap generation percentage"),
++                                       cl::init(100));
+ 
+ static cl::opt<FaultTrapType> cl_trap(
+     cl::desc("Choose trap type:"),
+@@ -85,37 +88,52 @@ class FaultHardener {
+     unsigned m_constant_factor;
+ 
+     uint64_t m_REG_value;
++    uint64_t m_trap_count;
++
++    uint32_t m_place_percentage;
++    uint32_t m_place_count;
+ 
+-    std::string m_place_percentage;
++    std::mt19937 m_generator;
++    std::uniform_int_distribution<uint32_t> m_distribution;
+ 
+-    void place_init_state(MachineBasicBlock &MBB, MachineBasicBlock::instr_iterator MI);
+-    void place_trap(MachineBasicBlock::instr_iterator MI);
+-    void place_check(MachineFunction::iterator &MBBI, MachineBasicBlock::instr_iterator &MI, bool before);
++    void place_init(MachineBasicBlock &MBB, MachineInstr &MI);
++    void place_trap(MachineBasicBlock &MBB, MachineInstr &MI);
++    void place_check(MachineBasicBlock &MBB, MachineInstr &MI);
++    // void place_check(MachineFunction::iterator &MBBI, MachineBasicBlock::instr_iterator &MI, bool before);
+ 
+     std::pair<MachineBasicBlock *, MachineBasicBlock *> generate_if(unsigned cond, MachineBasicBlock::instr_iterator MI,
+                                                                     bool before);
+ 
++    MachineBasicBlock *generate_abort_jcc(MachineBasicBlock::instr_iterator MI, bool before,
++                                          MachineBasicBlock *AbortMBB);
++
+     unsigned generateConstant(uint64_t constant) {
+         IntegerType *type  = IntegerType::getInt64Ty(MF.getFunction().getContext());
+         Constant *   value = ConstantInt::get(type, constant, false);
+         return MF.getConstantPool()->getConstantPoolIndex(value, {});
+     }
+ 
++    bool randomly_place_trap() {
++        return m_distribution(m_generator) <= m_place_percentage;
++    }
++
+   public:
+     FaultHardener(MachineFunction &MF)
+-      : REG { X86::R11 }
++      : REG { X86::R12 }
+       , m_trap_type { cl_trap.getValue() }
+       , MF { MF }
+       , STI { MF.getSubtarget<X86Subtarget>() }
+       , TRI { *STI.getRegisterInfo() }
+       , TII { *STI.getInstrInfo() }
+       , m_REG_value { 0 }
+-      , m_place_percentage { cl_percentage.getValue() } //
++      , m_trap_count { 0 }
++      , m_generator { } 
++      , m_distribution{ 1, 100 } //
+     {
+         switch ( m_trap_type ) {
+             case FaultTrapType::IMUL: {
+-                m_init   = 0x5555555555555555ull;
+-                m_factor = 0x11;
++                m_init   = 0x1234567abff0000ull; // 0x5555555555555555ull;
++                m_factor = 0x10001;
+                 break;
+             }
+             case FaultTrapType::SHL: {
+@@ -126,6 +144,12 @@ class FaultHardener {
+         }
+         m_constant_init   = generateConstant(m_init);
+         m_constant_factor = generateConstant(m_factor);
++
++        uint32_t p         = cl_percentage.getValue();
++        m_place_count      = p / 100;
++        m_place_percentage = p % 100;
++
++        m_generator.seed(0xdeadbeaf);
+     }
+ 
+     void harden_machine_function();
+@@ -165,14 +189,14 @@ FunctionPass *llvm::createX86FaultHardeningPass() {
+ namespace {
+ 
+ // copied from cmove placement
+-static bool eflags_in_use(MachineBasicBlock::instr_iterator MI) {
+-    if ( MI->killsRegister(X86::EFLAGS) )
++static bool eflags_in_use(MachineInstr &MI) {
++    if ( MI.killsRegister(X86::EFLAGS) )
+         return true;
+ 
+     // The EFLAGS operand of MI might be missing a kill marker.
+     // Figure out whether EFLAGS operand should LIVE after MI instruction.
+-    MachineBasicBlock *         BB    = MI->getParent();
+-    MachineBasicBlock::iterator ItrMI = MI;
++    MachineBasicBlock *         BB    = MI.getParent();
++    MachineBasicBlock::iterator ItrMI = MachineBasicBlock::instr_iterator(MI);
+ 
+     // Scan forward through BB for a use/def of EFLAGS.
+     for ( auto I = ItrMI, E = BB->end(); I != E; ++I ) {
+@@ -197,79 +221,175 @@ void FaultHardener::harden_machine_function() {
+         return;
+     }
+ 
+-    bool print = false;
+-
+-    for ( auto MBBI = MF.begin(); MBBI != MF.end(); ++MBBI ) {
++    for ( MachineBasicBlock &MBB : MF ) {
+ 
+-        bool place_init = true;
++        bool do_place_init = true;
+ 
+-        for ( auto MI = MBBI->instr_begin(); MI != MBBI->instr_end(); ++MI ) {
+-            if ( MI->isMetaInstruction() ) {
++        for ( MachineInstr &MI : MBB ) {
++            if ( MI.isMetaInstruction() ) {
+                 continue;
+             }
+ 
+-            if ( MI->getOpcode() == X86::SHL64ri ) {
+-                // print = true;
++            if ( do_place_init ) {
++                place_init(MBB, MI);
++                do_place_init = false;
+             }
+ 
+-            if ( place_init ) {
+-                place_init_state(*MBBI, MI);
+-                place_init = false;
++            if ( !eflags_in_use(MI) ) {
++
++                for (uint32_t i = 0; i < m_place_count; ++i) {
++                    place_trap(MBB, MI);
++                }
++
++                if ( randomly_place_trap() ) {
++                    place_trap(MBB, MI);
++                }
+             }
+ 
+-            if ( !eflags_in_use(MI) ) {
+-                place_trap(MI);
++            if ( MI.isCall() || MI.isReturn() || MI.isBranch() ) {
++                place_check(MBB, MI);
++                do_place_init = true;
+             }
+ 
++            /*if ( MI->getOpcode() == X86::UCOMISDrr ) {
++                llvm::errs() << "found\n";
++                for ( auto MI2 = MI; MI2 != MBBI->instr_end() && MI2 != std::next(MI, 3); ++MI2 ) {
++                    MI2->print(errs());
++                    if ( MI2->getOpcode() == X86::JCC_1 ) {
++                        llvm::errs() << "\nisBundled: " << MI2->isBundled()
++                                     << "\nisInsideBundle: " << MI2->isInsideBundle()
++                                     << "\ntype: " << MI2->getOperand(0).getType() << " v "
++                                     << MachineOperand::MO_MachineBasicBlock
++                                     << "\nName: " << MI2->getOperand(0).getMBB()->getName()
++                                     << "\nSafeToMove: " << '\n';
++                    }
++                }
++            }
++
++            if ( MI->isBundled() ) {
++                llvm::errs() << "WHAT IS BUNDLED?!\n";
++            }*/
++
++            /*if ( !eflags_in_use(MI) ) {
++                place_trap(*MBBI, MI);
++            }*/
++
+             // if return pop also reg
+-            if ( MI->isReturn() || MI->isBranch() ) {
+-                place_check(MBBI, MI, true);
++            /*if ( MI->isReturn() ) {
++                BuildMI(*MBBI, MI, DebugLoc {}, TII.get(X86::CALL64pcrel32)).addExternalSymbol("__fault_check");
++            }*/
++            /*else if ( MI->isBranch() ) {
++                // place_check(MBBI, MI, true);
+             }
+             else if ( MI->isCall() ) {
+                 place_check(MBBI, MI, true);
+-                place_init = true;
++                place_init = true; // we need to place the init after the call again
+             }
+             // place check at the end
+             else if ( std::next(MI) == MBBI->instr_end() ) {
+-                place_check(MBBI, MI, false);
+-                break;
++                // place_check(MBBI, MI, true);
+             }
+ 
+             if ( MI == MBBI->instr_end() ) {
+                 break;
+-            }
++            }*/
+         }
+     }
+-    if ( print ) {
++    if ( false ) {
+         for ( auto MBBI = MF.begin(); MBBI != MF.end(); ++MBBI ) {
++            errs() << MBBI->getName() << ":\n";
+             for ( auto MI = MBBI->instr_begin(); MI != MBBI->instr_end(); ++MI ) {
+                 MI->print(errs());
+-                errs() << "\n";
++                // errs() << "\n";
+             }
+         }
+     }
++    // MF.insert(MF.end(), AbortMBB);
+ }
+ 
+ #define USE_AES 0
+ 
+-void FaultHardener::place_init_state(MachineBasicBlock &MBB, MachineBasicBlock::instr_iterator MI) {
+-
+-    BuildMI(MBB, MI, DebugLoc {}, TII.get(X86::MOV64rm))
+-        .addReg(REG)                            // dst
+-        .MIB_ADD_MEM_CONSTANT(m_constant_init); // src
++void FaultHardener::place_init(MachineBasicBlock &MBB, MachineInstr &MI) {
++    if ( cl_inplace ) {
++        // if inplace is specified no need to init the register
++        return;
++    }
+ 
+-    m_REG_value = m_init;
++    BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)).addDef(REG).MIB_ADD_MEM_CONSTANT(m_constant_init);
++    m_REG_value  = m_init;
++    m_trap_count = 0;
+ }
+ 
+-void FaultHardener::place_trap(MachineBasicBlock::instr_iterator MI) {
++void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
++
++    bool eflags_used = eflags_in_use(MI);
++
++    if ( cl_inplace ) {
++
++        if ( eflags_used ) {
++            BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
++        }
++
++        BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rmi8))
++            .addDef(REG)                                // output = x * y
++            .MIB_ADD_MEM_SYMBOL("__fault_mul_constant") //
++            .addImm(0x11);                              // y
++
++        BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm))
++            .addDef(REG)                               // output = x * y
++            .MIB_ADD_MEM_SYMBOL("__fault_mul_result"); //
++
++        BuildMI(MBB, MI, {}, TII.get(X86::JCC_1))
++            .addExternalSymbol("__fault_abort") // target
++            .addImm(X86::COND_NE);              // type
++
++        if ( eflags_used ) {
++            BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
++        }
++    }
++    else {
++        if ( eflags_used ) {
++            BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
++        }
++
++        BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32))
++            .addDef(REG)       // output = x * y
++            .addReg(REG)       // x
++            .addImm(m_factor); // y
++
++        if ( eflags_used ) {
++            BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
++        }
++
++        m_REG_value = m_REG_value * m_factor;
+ 
++    }
++
++    return;
++#if 0
+     switch ( m_trap_type ) {
+         case FaultTrapType::IMUL: {
++#if 0
+             BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::IMUL64rm))
+                 .addReg(REG)                              // output = x * y
+                 .addReg(REG)                              // x
+                 .MIB_ADD_MEM_CONSTANT(m_constant_factor); // y
++#else
++            // MI->print(errs());
++            BuildMI(MBB, MI, DebugLoc {}, TII.get(X86::IMUL64rri32))
++                .addDef(REG)       // output = x * y
++                .addReg(REG)       // x
++                .addImm(m_factor); // y
++
++            BuildMI(MBB, MI, DebugLoc {}, TII.get(X86::ADD64ri8))
++                .addDef(REG) // output = x + 1
++                .addReg(REG)
++                .addImm(1);
++#endif
++
+             m_REG_value *= m_factor;
++            m_REG_value += 1;
++            m_trap_count++;
+             break;
+         }
+         case FaultTrapType::SHL: {
+@@ -321,33 +441,71 @@ void FaultHardener::place_trap(MachineBasicBlock::instr_iterator MI) {
+         BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::OR64mr))
+             .MIB_ADD_MEM_SYMBOL("__fault_mask") // out |= in
+             .addReg(REG);                       // in
+-
++        /*
+         BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::POPCNT64rr))
+             .addReg(REG)  // out = popcount(in)
+             .addReg(REG); // in
+ 
+         BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::ADD64mr))
+             .MIB_ADD_MEM_SYMBOL("__fault_count") // output += x
+-            .addReg(REG);                        // x
++            .addReg(REG);                        // x*/
+ 
+         BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::MOV64rm))
+             .addReg(REG)                                          // out = in
+             .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // in
+     }
++#endif
+ }
+ 
+-void FaultHardener::place_check(MachineFunction::iterator &MBBI, MachineBasicBlock::instr_iterator &MI, bool before) {
++void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
++    if ( cl_inplace ) {
++        // if inplace specified the check was already done by the trap
++        return;
++    }
++
++    bool eflags_used = eflags_in_use(MI);
++
++    if ( eflags_used ) {
++        BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
++    }
++
++    BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm))
++        .addReg(REG)                                          // x
++        .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
++
++    BuildMI(MBB, MI, {}, TII.get(X86::JCC_1))
++        .addExternalSymbol("__fault_abort") // target
++        .addImm(X86::COND_NE);
++
++    if ( eflags_used ) {
++        BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
++    }
++
++    return;
++
++#if 0
+     if ( cl_mask ) {
+         // MI = std::next(MI);
+         // place_init_state(*MBBI, MI);
+         return;
+     }
+     MachineBasicBlock &MBB         = *MBBI;
+-    DebugLoc           DL          = MI->getDebugLoc();
+-    bool               eflags_used = eflags_in_use(MI);
++    DebugLoc           DL          = DebugLoc {}; // MI->getDebugLoc();
++    bool               eflags_used = eflags_in_use(*MI);
+ 
+     MachineBasicBlock::instr_iterator where = before ? MI : std::next(MI);
+ 
++    // BuildMI(MBB, where, DL, TII.get(X86::NOOP));
++
++    BuildMI(MBB, where, DL, TII.get(X86::CALL64pcrel32)).addExternalSymbol("__fault_check");
++
++    // BuildMI(MBB, where, DL, TII.get(X86::CALL64r)).addReg(X86::RAX);
++
++    // set the iterator to the last instruction
++    MI = std::next(MI);
++
++    return;
++
+     if ( eflags_used ) {
+         BuildMI(MBB, where, DL, TII.get(X86::PUSHF64));
+     }
+@@ -356,6 +514,63 @@ void FaultHardener::place_check(MachineFunction::iterator &MBBI, MachineBasicBlo
+         .addReg(REG)                                          // x
+         .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
+ 
++    BuildMI(MBB, MI, {}, TII.get(X86::JCC_1))
++        .addExternalSymbol("__fault_abort") // target
++        .addImm(X86::COND_NE);
++    
++
++        if ( eflags_used ) {
++        BuildMI(MBB, where, DL, TII.get(X86::POPF64));
++    }
++
++
++    BuildMI(MBB, where, DL, TII.get(X86::SETCCr))
++        .addReg(REG)                                          // x
++        .addImm(X86::COND_NE);
++        
++    BuildMI(MBB, where, DL, TII.get(X86::ADD64mr)) 
++        .MIB_ADD_MEM_SYMBOL("__fault_count")
++        .addReg(REG);
++
++
++    if ( eflags_used ) {
++        BuildMI(MBB, where, DL, TII.get(X86::POPF64));
++    }
++
++    return;
++#elif 0
++
++    // jump
++    BuildMI(MBB, where, DL, TII.get(X86::JCC_1))
++        .addExternalSymbol("__fault_abort") // target
++        .addImm(X86::COND_NE);              // type
++
++    /*BuildMI(MBB, where, DL, TII.get(X86::CALL64pcrel32))
++        .addExternalSymbol("__fault_abort");*/
++
++    if ( eflags_used ) {
++        BuildMI(MBB, where, DL, TII.get(X86::POPF64));
++    }
++
++    return;
++
++#elif 1
++
++#elif 0
++
++    __fault_checks
++
++        MachineBasicBlock *AfterMBB = generate_abort_jcc(MI, before, AbortMBB);
++
++    MI = AfterMBB->instr_begin();
++
++    if ( eflags_used ) {
++        BuildMI(*AfterMBB, MI, DL, TII.get(X86::POPF64));
++    }
++    // place_init_state(*AfterMBB, MI);
++    MBBI = AfterMBB->getIterator();
++
++#else
+     auto blocks   = generate_if(X86::COND_E, MI, before);
+     auto ThenMBB  = blocks.first;
+     auto AfterMBB = blocks.second;
+@@ -379,6 +594,7 @@ void FaultHardener::place_check(MachineFunction::iterator &MBBI, MachineBasicBlo
+     }
+     // place_init_state(*AfterMBB, MI);
+     MBBI = AfterMBB->getIterator();
++#endif
+ }
+ 
+ std::pair<MachineBasicBlock *, MachineBasicBlock *>
+@@ -411,11 +627,46 @@ std::pair<MachineBasicBlock *, MachineBasicBlock *>
+     ThenMBB->addSuccessor(AfterMBB);
+ 
+     // jump
+-    BuildMI(MBB, MI->getDebugLoc(), TII.get(X86::JCC_1))
++    BuildMI(MBB, DebugLoc {}, TII.get(X86::JCC_1))
+         .addMBB(AfterMBB) // target
+         .addImm(cond);    // type
+ 
+     return std::make_pair(ThenMBB, AfterMBB);
+ }
+ 
++MachineBasicBlock *FaultHardener::generate_abort_jcc(MachineBasicBlock::instr_iterator MI, bool before,
++                                                     MachineBasicBlock *AbortMBB) {
++
++    // generate:
++    // if (cond) {
++    //    then
++    // }
++    // after
++
++    MachineBasicBlock *       MBB = MI->getParent();
++    MachineFunction *         F   = MBB->getParent();
++    MachineFunction::iterator it  = ++(MBB->getIterator());
++
++    MachineBasicBlock *AfterMBB = F->CreateMachineBasicBlock(MBB->getBasicBlock());
++
++    F->insert(it, AfterMBB);
++
++    MachineBasicBlock::instr_iterator split = before ? MI : std::next(MI);
++
++    AfterMBB->splice(AfterMBB->begin(), MBB, split, MBB->end());
++    AfterMBB->transferSuccessorsAndUpdatePHIs(MBB);
++
++    MBB->addSuccessor(AfterMBB);
++    MBB->addSuccessor(AbortMBB);
++
++    // ThenMBB->addSuccessor(AfterMBB);
++
++    // jump
++    BuildMI(MBB, DebugLoc {}, TII.get(X86::JCC_1))
++        .addMBB(AbortMBB)      // target
++        .addImm(X86::COND_NE); // type
++
++    return AfterMBB;
++}
++
+ } // namespace
+\ No newline at end of file
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index 7616c778e..7ffbfaa71 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -596,7 +596,7 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+     }
+   }
+ 
+-  for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R11) )
++  for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R12) )
+       Reserved.set(SubReg);
+   // for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R15) )
+   //    Reserved.set(SubReg);
+-- 
+2.25.1
+
+
+From 78de5ea0d86d1fe9369bb04335405551d19b1919 Mon Sep 17 00:00:00 2001
+From: Minefield <minefield@minefield.minefield>
+Date: Tue, 26 Jan 2021 17:00:48 +0100
+Subject: [PATCH 3/5] cleanup distinct targets ... getting there
+
+---
+ llvm/lib/Target/X86/X86FaultHardeningPass.cpp | 473 ++++++++++--------
+ llvm/lib/Target/X86/X86RegisterInfo.cpp       |   4 +
+ 2 files changed, 268 insertions(+), 209 deletions(-)
+
+diff --git a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+index 367eaf6d1..6ffc1f5cf 100644
+--- a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
++++ b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+@@ -24,12 +24,15 @@
+ 
+ #include <string>
+ #include <tuple>
++#include <unordered_map>
+ 
+ #define NAME       "fault-hardening"
+ #define DEBUG_TYPE NAME
+ 
+ using namespace llvm;
+ 
++#define USE_IMM 0
++
+ #define MIB_ADD_MEM_CONSTANT(_index)               \
+     addReg(X86::RIP)                  /*base*/     \
+         .addImm(1)                    /*scale*/    \
+@@ -46,27 +49,41 @@ using namespace llvm;
+ 
+ namespace {
+ 
+-enum class FaultTrapType : int { IMUL, SHL };
+-
+ // Commandline Options
+ 
+-static cl::opt<bool> cl_enabled("fh-enable", cl::NotHidden, cl::desc(NAME ": enable fault hardening"), cl::init(false));
++// enable mitigation
++static cl::opt<int> cl_percentage("fh-enable", cl::NotHidden, cl::desc(NAME ": enable fault hardening with percentage"),
++                                  cl::init(0));
+ 
+-static cl::opt<bool> cl_inplace("fh-inplace-check", cl::NotHidden, cl::desc(NAME ": check faults inplace"),
+-                                cl::init(false));
++// handling
++enum class MitigationType : int { INPLACE, STATIC, DYNBB, FREE };
+ 
+-static cl::opt<bool> cl_mask("fh-mask", cl::NotHidden, cl::desc(NAME ": monitor fault mask"), cl::init(false));
++static cl::opt<MitigationType>
++    cl_type("fh-type", cl::desc(NAME ": choose mitigation type:"),
++            cl::values(cl::OptionEnumValue { "inplace", static_cast<int>(MitigationType::INPLACE), "" },
++                       cl::OptionEnumValue { "static", static_cast<int>(MitigationType::STATIC), "" },
++                       cl::OptionEnumValue { "dynbb", static_cast<int>(MitigationType::DYNBB), "" },
++                       cl::OptionEnumValue { "FREE", static_cast<int>(MitigationType::FREE), "" }),
++            cl::init(MitigationType::INPLACE));
+ 
+-static cl::opt<bool> cl_place_ud("fh-ud", cl::NotHidden, cl::desc(NAME ": place ud trap"), cl::init(false));
++// trap type
++enum class FaultTrapType : int { IMUL, SHL };
+ 
+-static cl::opt<uint32_t> cl_percentage("fh-percentage", cl::NotHidden, cl::desc(NAME ": trap generation percentage"),
+-                                       cl::init(100));
++static cl::opt<FaultTrapType>
++    cl_trap("fh-trap", cl::desc(NAME ": choose trap type:"),
++            cl::values(cl::OptionEnumValue { "imul", static_cast<int>(FaultTrapType::IMUL), "trap type IMUL" },
++                       cl::OptionEnumValue { "shl", static_cast<int>(FaultTrapType::SHL), "trap type SHL" }),
++            cl::init(FaultTrapType::IMUL));
+ 
+-static cl::opt<FaultTrapType> cl_trap(
+-    cl::desc("Choose trap type:"),
+-    cl::values(cl::OptionEnumValue { "fh-trap-imul", static_cast<int>(FaultTrapType::IMUL), NAME ": trap type IMUL" },
+-               cl::OptionEnumValue { "fh-trap-shl", static_cast<int>(FaultTrapType::SHL), NAME ": trap type SHL" }),
+-    cl::init(FaultTrapType::IMUL));
++// handling
++enum class HandlingType : int { ABORT, COUNT };
++
++static cl::opt<HandlingType> cl_handling(
++    "fh-handeling", cl::desc(NAME ": choose the behaviour when a fault ocurred:"),
++    cl::values(cl::OptionEnumValue { "abort", static_cast<int>(HandlingType::ABORT), NAME "call abort handler" },
++               //cl::OptionEnumValue { "mask", static_cast<int>(HandlingType::MASK), NAME "mask the bit flips" },
++               cl::OptionEnumValue { "count", static_cast<int>(HandlingType::COUNT), NAME "count the faults" }),
++    cl::init(HandlingType::ABORT));
+ 
+ // STATISTIC(HelloCounter, "Counts number of functions greeted");
+ 
+@@ -93,7 +110,7 @@ class FaultHardener {
+     uint32_t m_place_percentage;
+     uint32_t m_place_count;
+ 
+-    std::mt19937 m_generator;
++    std::mt19937                            m_generator;
+     std::uniform_int_distribution<uint32_t> m_distribution;
+ 
+     void place_init(MachineBasicBlock &MBB, MachineInstr &MI);
+@@ -127,13 +144,13 @@ class FaultHardener {
+       , TII { *STI.getInstrInfo() }
+       , m_REG_value { 0 }
+       , m_trap_count { 0 }
+-      , m_generator { } 
+-      , m_distribution{ 1, 100 } //
++      , m_generator {}
++      , m_distribution { 1, 100 } //
+     {
+         switch ( m_trap_type ) {
+             case FaultTrapType::IMUL: {
+                 m_init   = 0x1234567abff0000ull; // 0x5555555555555555ull;
+-                m_factor = 0x10001;
++                m_factor = 0x11;
+                 break;
+             }
+             case FaultTrapType::SHL: {
+@@ -163,7 +180,7 @@ struct X86FaultHardening : public MachineFunctionPass {
+     }
+ 
+     bool runOnMachineFunction(MachineFunction &MF) override {
+-        if ( !cl_enabled ) {
++        if ( cl_percentage.getValue() == 0 ) {
+             return false;
+         }
+         FaultHardener { MF }.harden_machine_function();
+@@ -218,13 +235,20 @@ static bool eflags_in_use(MachineInstr &MI) {
+ 
+ void FaultHardener::harden_machine_function() {
+     if ( !STI.is64Bit() ) {
+-        return;
++         return;
+     }
++    /*struct MBBData {
++        std::unorder_map<MachineBasicBlock*, uint64_t> m_values_at_jump;
++        uint64_t m_last_reg_val;
++    };*/ 
+ 
+-    for ( MachineBasicBlock &MBB : MF ) {
++    //std::unorder_map<MachineBasicBlock*, MBBData> lookup;
+ 
++    for ( MachineBasicBlock &MBB : MF ) {
+         bool do_place_init = true;
+ 
++        //if (MBB.predecessors)
++
+         for ( MachineInstr &MI : MBB ) {
+             if ( MI.isMetaInstruction() ) {
+                 continue;
+@@ -237,63 +261,46 @@ void FaultHardener::harden_machine_function() {
+ 
+             if ( !eflags_in_use(MI) ) {
+ 
+-                for (uint32_t i = 0; i < m_place_count; ++i) {
++                for ( uint32_t i = 0; i < m_place_count; ++i ) {
+                     place_trap(MBB, MI);
+-                }
++                 } 
+ 
+                 if ( randomly_place_trap() ) {
+                     place_trap(MBB, MI);
+                 }
+             }
+-
+-            if ( MI.isCall() || MI.isReturn() || MI.isBranch() ) {
+-                place_check(MBB, MI);
+-                do_place_init = true;
+-            }
+-
+-            /*if ( MI->getOpcode() == X86::UCOMISDrr ) {
+-                llvm::errs() << "found\n";
+-                for ( auto MI2 = MI; MI2 != MBBI->instr_end() && MI2 != std::next(MI, 3); ++MI2 ) {
+-                    MI2->print(errs());
+-                    if ( MI2->getOpcode() == X86::JCC_1 ) {
+-                        llvm::errs() << "\nisBundled: " << MI2->isBundled()
+-                                     << "\nisInsideBundle: " << MI2->isInsideBundle()
+-                                     << "\ntype: " << MI2->getOperand(0).getType() << " v "
+-                                     << MachineOperand::MO_MachineBasicBlock
+-                                     << "\nName: " << MI2->getOperand(0).getMBB()->getName()
+-                                     << "\nSafeToMove: " << '\n';
+-                    }
++            
++            bool is_last = std::next(MI.getIterator()) == MBB.end();
++            bool is_ctf = MI.isCall() || MI.isReturn() || MI.isBranch();
++            if ( is_ctf || is_last ) {
++
++                switch (cl_type.getValue()) {
++                    case MitigationType::INPLACE: 
++                        break;
++
++                    case MitigationType::STATIC:
++                        // ugliest hack of my live ... 
++                        if (!is_ctf && is_last && MI.getOpcode() != X86::NOOP) {
++                            BuildMI(MBB, MBB.end(), {}, TII.get(X86::NOOP));
++                        } else {
++                            // check now since value cannot be determinded over jumps
++                            place_check(MBB, MI);
++                            do_place_init = MI.isCall();
++                        }
++                        break;
++
++                    case MitigationType::DYNBB:
++                        // no need check is done at beginning of BB
++                        break;
++                        
++                    case MitigationType::FREE:
++                        // no need check is done at beginning of BB
++                        break;
+                 }
+             }
+-
+-            if ( MI->isBundled() ) {
+-                llvm::errs() << "WHAT IS BUNDLED?!\n";
+-            }*/
+-
+-            /*if ( !eflags_in_use(MI) ) {
+-                place_trap(*MBBI, MI);
+-            }*/
+-
+-            // if return pop also reg
+-            /*if ( MI->isReturn() ) {
+-                BuildMI(*MBBI, MI, DebugLoc {}, TII.get(X86::CALL64pcrel32)).addExternalSymbol("__fault_check");
+-            }*/
+-            /*else if ( MI->isBranch() ) {
+-                // place_check(MBBI, MI, true);
+-            }
+-            else if ( MI->isCall() ) {
+-                place_check(MBBI, MI, true);
+-                place_init = true; // we need to place the init after the call again
+-            }
+-            // place check at the end
+-            else if ( std::next(MI) == MBBI->instr_end() ) {
+-                // place_check(MBBI, MI, true);
+-            }
+-
+-            if ( MI == MBBI->instr_end() ) {
+-                break;
+-            }*/
+         }
++
++        //lookup[&MBB].m_last_reg_val = m_REG_value;
+     }
+     if ( false ) {
+         for ( auto MBBI = MF.begin(); MBBI != MF.end(); ++MBBI ) {
+@@ -307,181 +314,229 @@ void FaultHardener::harden_machine_function() {
+     // MF.insert(MF.end(), AbortMBB);
+ }
+ 
+-#define USE_AES 0
+-
+ void FaultHardener::place_init(MachineBasicBlock &MBB, MachineInstr &MI) {
+-    if ( cl_inplace ) {
+-        // if inplace is specified no need to init the register
+-        return;
+-    }
++    switch (cl_type.getValue()) {
++        case MitigationType::INPLACE:
++            // doesn't use init
++            break;
++
++        case MitigationType::STATIC:
++            // load the init value into the register
++            BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)) //
++                .addDef(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
++            m_trap_count = 0;
++            break;
+ 
+-    BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)).addDef(REG).MIB_ADD_MEM_CONSTANT(m_constant_init);
+-    m_REG_value  = m_init;
+-    m_trap_count = 0;
++        case MitigationType::DYNBB:
++            // in dynbb we palce checks at the beginning of basic blocks
++            place_check(MBB, MI);
++
++            break;
++            
++        case MitigationType::FREE:
++            // doesn't use init
++            break;
++    }
+ }
+ 
+ void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
+ 
+-    bool eflags_used = eflags_in_use(MI);
++    /*bool eflags_used = eflags_in_use(MI);
++    if ( eflags_used ) {
++        BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
++    }*/
+ 
+-    if ( cl_inplace ) {
++    switch (cl_type.getValue()) {
++        case MitigationType::INPLACE:
++            // REG = __fault_mul_checks[0] * 0x11
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rmi8))
++                .addDef(REG)                                // output = x * y
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_checks")    //
++                .addImm(0x11);                             // y
+ 
+-        if ( eflags_used ) {
+-            BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
+-        }
++            place_check(MBB, MI);
++            break;
+ 
+-        BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rmi8))
+-            .addDef(REG)                                // output = x * y
+-            .MIB_ADD_MEM_SYMBOL("__fault_mul_constant") //
+-            .addImm(0x11);                              // y
++        case MitigationType::STATIC:
++#if USE_IMM
++            // REG = REG * 0x11
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
++                .addDef(REG)
++                .addReg(REG)
++                .addImm(0x11);
++#else       
++            // REG = REG * __fault_mul_factor
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(REG)
++                .addReg(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++#endif
++            m_trap_count++;
++            break;
+ 
+-        BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm))
+-            .addDef(REG)                               // output = x * y
+-            .MIB_ADD_MEM_SYMBOL("__fault_mul_result"); //
++        case MitigationType::DYNBB:
++#if USE_IMM
++            // REG = REG * 0x11
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
++                .addDef(REG)
++                .addReg(REG)
++                .addImm(0x11);
++#else       
++            // REG = REG * __fault_mul_factor
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(REG)
++                .addReg(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++#endif
++            // R13 = R13 + 8
++            BuildMI(MBB, MI, {}, TII.get(X86::ADD64ri8))
++                .addDef(X86::R13) 
++                .addReg(X86::R13)
++                .addImm(8);
++            break;
+ 
+-        BuildMI(MBB, MI, {}, TII.get(X86::JCC_1))
+-            .addExternalSymbol("__fault_abort") // target
+-            .addImm(X86::COND_NE);              // type
++        case MitigationType::FREE:
++            // REG = REG * __fault_mul_factor
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(REG)
++                .addReg(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
+ 
+-        if ( eflags_used ) {
+-            BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
+-        }
++            // R13b = R13b + 8
++            BuildMI(MBB, MI, {}, TII.get(X86::ADD8ri))
++                .addDef(X86::R13) // output = x * y
++                .addReg(X86::R13)
++                .addImm(8);
++            break;
+     }
+-    else {
+-        if ( eflags_used ) {
+-            BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
+-        }
+-
+-        BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32))
+-            .addDef(REG)       // output = x * y
+-            .addReg(REG)       // x
+-            .addImm(m_factor); // y
+-
+-        if ( eflags_used ) {
+-            BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
+-        }
+-
+-        m_REG_value = m_REG_value * m_factor;
++    /*if ( eflags_used ) {
++        BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
++    }*/
++}
+ 
++void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
++    bool eflags_used = eflags_in_use(MI);
++    if ( eflags_used ) {
++        BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
+     }
++    
++    switch (cl_type.getValue()) {
++        case MitigationType::INPLACE:
++            //EFLAGS = REG == __fault_checks[1]
++            BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
++                .addReg(REG)
++                .addReg(X86::R13)
++                .addImm(1)
++                .addReg(X86::NoRegister)
++                .addImm(8) // disp
++                .addReg(X86::NoRegister);
++            break;
+ 
+-    return;
+-#if 0
+-    switch ( m_trap_type ) {
+-        case FaultTrapType::IMUL: {
+-#if 0
+-            BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::IMUL64rm))
+-                .addReg(REG)                              // output = x * y
+-                .addReg(REG)                              // x
+-                .MIB_ADD_MEM_CONSTANT(m_constant_factor); // y
+-#else
+-            // MI->print(errs());
+-            BuildMI(MBB, MI, DebugLoc {}, TII.get(X86::IMUL64rri32))
+-                .addDef(REG)       // output = x * y
+-                .addReg(REG)       // x
+-                .addImm(m_factor); // y
+-
+-            BuildMI(MBB, MI, DebugLoc {}, TII.get(X86::ADD64ri8))
+-                .addDef(REG) // output = x + 1
++        case MitigationType::STATIC:
++            //EFLAGS = REG == __fault_checks[m_trap_count]
++            BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
+                 .addReg(REG)
+-                .addImm(1);
+-#endif
++                .addReg(X86::R13)
++                .addImm(1)
++                .addReg(X86::NoRegister)
++                .addImm(m_trap_count * 8) // disp
++                .addReg(X86::NoRegister);
++            break;
+ 
+-            m_REG_value *= m_factor;
+-            m_REG_value += 1;
+-            m_trap_count++;
++        case MitigationType::DYNBB:
++            // EFLAGS = REG == *R13
++            BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
++                .addReg(REG)
++                .addReg(X86::R13)
++                .addImm(1)
++                .addReg(X86::NoRegister)
++                .addImm(0) // disp
++                .addReg(X86::NoRegister);
+             break;
+-        }
+-        case FaultTrapType::SHL: {
+-            uint8_t r;
+-            if ( getRandomBytes(&r, sizeof(r)) ) {
+-                errs() << "can't get random number!\n";
+-            }
+ 
+-            uint64_t before = m_REG_value;
++        case MitigationType::FREE:
++            // REG = REG & __fault_mul_mask
++            BuildMI(MBB, MI, {}, TII.get(X86::AND64rm)) //
++                .addReg(REG)
++                .addReg(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_mask");
++                
++            // EFLAGS = REG == *R13
++            BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
++                .addReg(REG)
++                .addReg(X86::R13)
++                .addImm(1)
++                .addReg(X86::NoRegister)
++                .addImm(0) // disp
++                .addReg(X86::NoRegister);
++            break;
++    }
+ 
+-            if ( r < 128 ) {
+-                BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::SHRX64rm))
+-                    .addReg(REG)                             // output = x << y
+-                    .MIB_ADD_MEM_CONSTANT(m_constant_factor) // x
+-                    .addReg(REG);                            // y
++    switch ( cl_handling.getValue() ) {
++        case HandlingType::ABORT:
++            BuildMI(MBB, MI, {}, TII.get(X86::JCC_1)) //
++                .addExternalSymbol("__fault_abort")
++                .addImm(X86::COND_NE);
++            break;
+ 
+-                uint64_t shift  = m_REG_value & 0x3f;
+-                uint64_t result = m_factor >> shift;
+-                m_REG_value     = result;
++        case HandlingType::COUNT:
++            BuildMI(MBB, MI, {}, TII.get(X86::SETCCr)) //
++                .addDef(REG)
++                .addImm(X86::COND_NE);
+ 
+-                errs() << format("0x%16lx = 0x%16lx >> %ld -> 0x%16lx\n", result, m_factor, shift,
+-                                 before ^ m_REG_value);
+-            }
+-            else {
+-                BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::SHLX64rm))
+-                    .addReg(REG)                             // output = x << y
+-                    .MIB_ADD_MEM_CONSTANT(m_constant_factor) // x
+-                    .addReg(REG);                            // y
+-
+-                uint64_t shift  = m_REG_value & 0x3f;
+-                uint64_t result = m_factor << shift;
+-                m_REG_value     = result;
+-
+-                errs() << format("0x%16lx = 0x%16lx << %ld -> 0x%16lx\n", result, m_factor, shift,
+-                                 before ^ m_REG_value);
+-            }
++            BuildMI(MBB, MI, {}, TII.get(X86::AND64ri32)) //
++                .addDef(REG)
++                .addReg(REG)
++                .addImm(0xFF);
++
++            BuildMI(MBB, MI, {}, TII.get(X86::ADD64mr)) //
++                .MIB_ADD_MEM_SYMBOL("__fault_count")
++                .addReg(REG);
+ 
+             break;
+-        }
+     }
+ 
+-    if ( cl_mask ) {
++    // restore correct state if not aborted
++    if ( cl_handling.getValue() != HandlingType::ABORT) {
++        int64_t disp = 0;
+ 
+-        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::XOR64rm))
+-            .addReg(REG)                                          // output = x ^ y
+-            .addReg(REG)                                          // x
+-            .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
+-
+-        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::OR64mr))
+-            .MIB_ADD_MEM_SYMBOL("__fault_mask") // out |= in
+-            .addReg(REG);                       // in
+-        /*
+-        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::POPCNT64rr))
+-            .addReg(REG)  // out = popcount(in)
+-            .addReg(REG); // in
+-
+-        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::ADD64mr))
+-            .MIB_ADD_MEM_SYMBOL("__fault_count") // output += x
+-            .addReg(REG);                        // x*/
+-
+-        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(), TII.get(X86::MOV64rm))
+-            .addReg(REG)                                          // out = in
+-            .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // in
+-    }
+-#endif
+-}
++        switch (cl_type.getValue()) {
++            case MitigationType::INPLACE:
++                // no need
++                break;
+ 
+-void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+-    if ( cl_inplace ) {
+-        // if inplace specified the check was already done by the trap
+-        return;
+-    }
++            case MitigationType::DYNBB:
++                // prepare state for next round
++                BuildMI(MBB, MI, {}, TII.get(X86::LEA64r)) //
++                    .addReg(X86::R13)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
+ 
+-    bool eflags_used = eflags_in_use(MI);
++                BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)) //
++                    .addReg(X86::R12) 
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
++                break;
+ 
+-    if ( eflags_used ) {
+-        BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
++            case MitigationType::STATIC:
++                disp = m_trap_count * 8;
++                // intentional fall through
++            case MitigationType::FREE:
++                // EFLAGS = REG == *R13
++                BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)) //
++                    .addDef(X86::R12) 
++                    .addReg(X86::R13)
++                    .addImm(1)
++                    .addReg(X86::NoRegister)
++                    .addImm(disp)
++                    .addReg(X86::NoRegister);
++                break;
++        }
+     }
+ 
+-    BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm))
+-        .addReg(REG)                                          // x
+-        .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
+-
+-    BuildMI(MBB, MI, {}, TII.get(X86::JCC_1))
+-        .addExternalSymbol("__fault_abort") // target
+-        .addImm(X86::COND_NE);
+-
+     if ( eflags_used ) {
+         BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
+     }
+ 
+-    return;
+ 
+ #if 0
+     if ( cl_mask ) {
+@@ -554,7 +609,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+ 
+     return;
+ 
+-#elif 1
++#elif 0
+ 
+ #elif 0
+ 
+@@ -570,7 +625,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+     // place_init_state(*AfterMBB, MI);
+     MBBI = AfterMBB->getIterator();
+ 
+-#else
++#elif 0
+     auto blocks   = generate_if(X86::COND_E, MI, before);
+     auto ThenMBB  = blocks.first;
+     auto AfterMBB = blocks.second;
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index 7ffbfaa71..67edb973d 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -598,6 +598,10 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+ 
+   for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R12) )
+       Reserved.set(SubReg);
++
++    
++  for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R13) )
++      Reserved.set(SubReg);
+   // for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R15) )
+   //    Reserved.set(SubReg);
+ 
+-- 
+2.25.1
+
+
+From ac4f55c62cece7a53b52e21fd0af03396f80de9b Mon Sep 17 00:00:00 2001
+From: Minefiled <minefield@minefield.minefield>
+Date: Tue, 2 Feb 2021 23:30:18 +0100
+Subject: [PATCH 4/5] ..
+
+---
+ llvm/lib/Target/X86/X86FaultHardeningPass.cpp | 264 +++++++++++++++---
+ llvm/lib/Target/X86/X86RegisterInfo.cpp       |   5 +-
+ 2 files changed, 228 insertions(+), 41 deletions(-)
+
+diff --git a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+index 6ffc1f5cf..54a487607 100644
+--- a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
++++ b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+@@ -31,7 +31,8 @@
+ 
+ using namespace llvm;
+ 
+-#define USE_IMM 0
++#define USE_IMM 1
++#define USE_MEM 0
+ 
+ #define MIB_ADD_MEM_CONSTANT(_index)               \
+     addReg(X86::RIP)                  /*base*/     \
+@@ -49,22 +50,33 @@ using namespace llvm;
+ 
+ namespace {
+ 
++constexpr bool BUILD_FOR_TESTING = false;
++
+ // Commandline Options
+ 
+ // enable mitigation
+ static cl::opt<int> cl_percentage("fh-enable", cl::NotHidden, cl::desc(NAME ": enable fault hardening with percentage"),
+-                                  cl::init(0));
++                                  cl::init(BUILD_FOR_TESTING ? 100 : 0));
++
++static cl::opt<bool> cl_store("fh-store", cl::NotHidden, cl::desc(NAME ": place additional store after trap"));
++
++static cl::opt<uint64_t> cl_factor("fh-factor", cl::NotHidden, cl::desc(NAME ": "), cl::init(0x11));
++static cl::opt<uint64_t> cl_inverse("fh-inverse", cl::NotHidden, cl::desc(NAME ": "), cl::init(0x11));
++static cl::opt<bool> cl_imm("fh-use-imm", cl::NotHidden, cl::desc(NAME ": "));
++
+ 
+ // handling
+-enum class MitigationType : int { INPLACE, STATIC, DYNBB, FREE };
++enum class MitigationType : int { INPLACE, STATIC, DYNBB, FREE, DOUBLEMUL, MODINV };
+ 
+ static cl::opt<MitigationType>
+     cl_type("fh-type", cl::desc(NAME ": choose mitigation type:"),
+             cl::values(cl::OptionEnumValue { "inplace", static_cast<int>(MitigationType::INPLACE), "" },
+                        cl::OptionEnumValue { "static", static_cast<int>(MitigationType::STATIC), "" },
+                        cl::OptionEnumValue { "dynbb", static_cast<int>(MitigationType::DYNBB), "" },
+-                       cl::OptionEnumValue { "FREE", static_cast<int>(MitigationType::FREE), "" }),
+-            cl::init(MitigationType::INPLACE));
++                       cl::OptionEnumValue { "FREE", static_cast<int>(MitigationType::FREE), "" },
++                       cl::OptionEnumValue { "doublemul", static_cast<int>(MitigationType::DOUBLEMUL), "" },
++                       cl::OptionEnumValue { "modinv", static_cast<int>(MitigationType::MODINV), "" }),
++            cl::init(MitigationType::DOUBLEMUL));
+ 
+ // trap type
+ enum class FaultTrapType : int { IMUL, SHL };
+@@ -76,14 +88,15 @@ static cl::opt<FaultTrapType>
+             cl::init(FaultTrapType::IMUL));
+ 
+ // handling
+-enum class HandlingType : int { ABORT, COUNT };
++enum class HandlingType : int { ABORT, COUNT, PENDING };
+ 
+ static cl::opt<HandlingType> cl_handling(
+     "fh-handeling", cl::desc(NAME ": choose the behaviour when a fault ocurred:"),
+     cl::values(cl::OptionEnumValue { "abort", static_cast<int>(HandlingType::ABORT), NAME "call abort handler" },
+-               //cl::OptionEnumValue { "mask", static_cast<int>(HandlingType::MASK), NAME "mask the bit flips" },
+-               cl::OptionEnumValue { "count", static_cast<int>(HandlingType::COUNT), NAME "count the faults" }),
+-    cl::init(HandlingType::ABORT));
++               // cl::OptionEnumValue { "mask", static_cast<int>(HandlingType::MASK), NAME "mask the bit flips" },
++               cl::OptionEnumValue { "count", static_cast<int>(HandlingType::COUNT), NAME "count the faults" },
++               cl::OptionEnumValue { "pending", static_cast<int>(HandlingType::PENDING), NAME "mask the bit flips" }),
++    cl::init(HandlingType::PENDING));
+ 
+ // STATISTIC(HelloCounter, "Counts number of functions greeted");
+ 
+@@ -243,10 +256,22 @@ void FaultHardener::harden_machine_function() {
+     };*/ 
+ 
+     //std::unorder_map<MachineBasicBlock*, MBBData> lookup;
++    
++    if constexpr (BUILD_FOR_TESTING) {
++
++        // load the init value into the register
++        BuildMI(*MF.begin(), *MF.begin()->begin(), {}, TII.get(X86::MOV64ri32)) //
++            .addDef(X86::R14)
++            .addImm(cl_factor.getValue());
++
++        BuildMI(*MF.begin(), *MF.begin()->begin(), {}, TII.get(X86::MOV64rr)) //
++            .addReg(REG)
++            .addReg(X86::R13);
++    }
+ 
+     for ( MachineBasicBlock &MBB : MF ) {
+         bool do_place_init = true;
+-
++        
+         //if (MBB.predecessors)
+ 
+         for ( MachineInstr &MI : MBB ) {
+@@ -290,7 +315,18 @@ void FaultHardener::harden_machine_function() {
+                         break;
+ 
+                     case MitigationType::DYNBB:
+-                        // no need check is done at beginning of BB
++                        if ( m_trap_count != 0 ) {
++                            // R13 = R13 + 8*m_trap_count
++                            BuildMI(MBB, MI, {}, TII.get(X86::LEA64r))
++                                .addDef(X86::R13)
++                                .addReg(X86::R13)
++                                .addImm(1)
++                                .addReg(X86::NoRegister)
++                                .addImm(m_trap_count * 8) // disp
++                                .addReg(X86::NoRegister);
++                            // no need check is done at beginning of BB
++                            m_trap_count = 0;
++                        }
+                         break;
+                         
+                     case MitigationType::FREE:
+@@ -331,12 +367,19 @@ void FaultHardener::place_init(MachineBasicBlock &MBB, MachineInstr &MI) {
+         case MitigationType::DYNBB:
+             // in dynbb we palce checks at the beginning of basic blocks
+             place_check(MBB, MI);
+-
++            m_trap_count = 0;
+             break;
+             
+         case MitigationType::FREE:
+             // doesn't use init
+             break;
++
++        case MitigationType::DOUBLEMUL:
++        case MitigationType::MODINV:
++            // in dynbb we palce checks at the beginning of basic blocks
++            place_check(MBB, MI);
++            m_trap_count = 0;
++            break;
+     }
+ }
+ 
+@@ -359,41 +402,66 @@ void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
+             break;
+ 
+         case MitigationType::STATIC:
+-#if USE_IMM
+-            // REG = REG * 0x11
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
+-                .addDef(REG)
+-                .addReg(REG)
+-                .addImm(0x11);
+-#else       
+-            // REG = REG * __fault_mul_factor
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
+-                .addDef(REG)
+-                .addReg(REG)
+-                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
+-#endif
++            if (cl_imm) {
++                /*if (cl_factor.getValue() < 256) {
++                    // REG = REG * 0x11
++                    BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
++                        .addDef(REG)
++                        .addReg(REG)
++                        .addImm(cl_factor.getValue());
++                } else*/ {
++                    // REG = REG * 0x11
++                    BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
++                        .addDef(REG)
++                        .addReg(REG)
++                        .addImm(cl_factor.getValue());
++                }
++            } else {
++                // REG = REG * __fault_mul_factor
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                    .addDef(REG)
++                    .addReg(REG)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++            }
+             m_trap_count++;
+             break;
+ 
+         case MitigationType::DYNBB:
+-#if USE_IMM
+-            // REG = REG * 0x11
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
+-                .addDef(REG)
+-                .addReg(REG)
+-                .addImm(0x11);
+-#else       
+-            // REG = REG * __fault_mul_factor
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++            //if (cl_imm) {
++                /*if (cl_factor.getValue() < 256) {
++                    // REG = REG * 0x11
++                    BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
++                        .addDef(REG)
++                        .addReg(REG)
++                        .addImm(cl_factor.getValue());
++                } else*/ {
++                    // REG = REG * 0x11
++                    BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
++                        .addDef(REG)
++                        .addReg(REG)
++                        .addImm(cl_factor.getValue());
++                }
++            //} else {
++                // REG = REG * __fault_mul_factor
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                    .addDef(REG)
++                    .addReg(REG)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++            //}
++
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rr)) //
+                 .addDef(REG)
+                 .addReg(REG)
+-                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
+-#endif
+-            // R13 = R13 + 8
+-            BuildMI(MBB, MI, {}, TII.get(X86::ADD64ri8))
+-                .addDef(X86::R13) 
++                .addReg(X86::R14);
++
++
++             // R13b = R13b + 8
++            /*BuildMI(MBB, MI, {}, TII.get(X86::ADD64ri8))
++                .addDef(X86::R13) // output = x * y
+                 .addReg(X86::R13)
+-                .addImm(8);
++                .addImm(8);*/
++
++            m_trap_count+=3;
+             break;
+ 
+         case MitigationType::FREE:
+@@ -409,7 +477,75 @@ void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .addReg(X86::R13)
+                 .addImm(8);
+             break;
++
++        case MitigationType::DOUBLEMUL:
++            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                .addReg(X86::R12)
++                .addReg(X86::R12);*/
++
++            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64rr)) //
++                .addReg(X86::RBX)
++                .addReg(X86::R14)
++                .addReg(X86::RBX)
++                .addReg(X86::R14);*/
++                
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rr)) //
++                .addDef(X86::R12)
++                .addReg(X86::R12)
++                .addReg(X86::R14);
++            
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
++                .addDef(X86::R13)
++                .addReg(X86::R13)
++                .addImm(cl_factor.getValue());
++
++            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                .addReg(X86::R12)
++                .addReg(X86::R12);*/
++
++
++            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64rr)) //
++                .addReg(X86::RBX)
++                .addReg(X86::R14)
++                .addReg(X86::RBX)
++                .addReg(X86::R14);*/
++        
++            break;
++        case MitigationType::MODINV:
++            BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                .addReg(X86::R12)
++                .addReg(X86::R12);
++
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(X86::RAX)
++                .addReg(X86::RAX)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(X86::RAX)
++                .addReg(X86::RAX)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_inverse"); 
++
++            BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                .addReg(X86::R12)
++                .addReg(X86::R12);
++                
++            break;
+     }
++
++    if ( cl_store ) {
++        BuildMI(MBB, MI, {}, TII.get(X86::MOV64mr)) //
++            .MIB_ADD_MEM_SYMBOL("__fault_mul_store")
++            .addReg(REG);
++        /*BuildMI(MBB, MI, {}, TII.get(X86::MOV64mr)) //
++            .addReg(X86::R13)
++            .addImm(1)
++            .addReg(X86::NoRegister)
++            .addImm(m_trap_count * 8 + 2048*8)
++            .addReg(X86::NoRegister)
++            .addReg(REG);*/
++    }
++
+     /*if ( eflags_used ) {
+         BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
+     }*/
+@@ -471,6 +607,24 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .addImm(0) // disp
+                 .addReg(X86::NoRegister);
+             break;
++        
++        case MitigationType::DOUBLEMUL:
++
++            BuildMI(MBB, MI, {}, TII.get(X86::CMP64rr)) //
++                .addReg(REG)
++                .addReg(X86::R13);
++
++            if constexpr (BUILD_FOR_TESTING) {
++                MI.killsRegister(X86::R13);
++            
++            }
++            break;
++
++        case MitigationType::MODINV:
++            BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
++                .addReg(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_init");
++            break;
+     }
+ 
+     switch ( cl_handling.getValue() ) {
+@@ -495,6 +649,12 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .addReg(REG);
+ 
+             break;
++
++        case HandlingType::PENDING:
++            BuildMI(MBB, MI, {}, TII.get(X86::SETCCm)) //
++                .MIB_ADD_MEM_SYMBOL("__fault_pending")
++                .addImm(X86::COND_NE);
++            break;
+     }
+ 
+     // restore correct state if not aborted
+@@ -508,6 +668,11 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+ 
+             case MitigationType::DYNBB:
+                 // prepare state for next round
++                /*BuildMI(MBB, MI, {}, TII.get(X86::XOR8rr)) //
++                    .addDef(X86::R13)
++                    .addReg(X86::R13)
++                    .addReg(X86::R13);*/
++                
+                 BuildMI(MBB, MI, {}, TII.get(X86::LEA64r)) //
+                     .addReg(X86::R13)
+                     .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
+@@ -515,6 +680,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)) //
+                     .addReg(X86::R12) 
+                     .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
++
+                 break;
+ 
+             case MitigationType::STATIC:
+@@ -530,6 +696,24 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                     .addImm(disp)
+                     .addReg(X86::NoRegister);
+                 break;
++
++            case MitigationType::DOUBLEMUL:
++
++                BuildMI(MBB, MI, {}, TII.get(X86::MOV64rr)) //
++                    .addDef(REG)
++                    .addReg(X86::R13);
++                break;
++
++            case MitigationType::MODINV:
++                 BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                    .addDef(REG)
++                    .addReg(REG)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++
++                BuildMI(MBB, MI, {}, TII.get(X86::MOV64mr)) //
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_init")
++                    .addReg(REG);
++                break;
+         }
+     }
+ 
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index 67edb973d..6aee62e6a 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -599,9 +599,12 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+   for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R12) )
+       Reserved.set(SubReg);
+ 
+-    
+   for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R13) )
+       Reserved.set(SubReg);
++
++  for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R14) )
++      Reserved.set(SubReg);
++
+   // for ( const MCPhysReg &SubReg : subregs_inclusive(X86::R15) )
+   //    Reserved.set(SubReg);
+ 
+-- 
+2.25.1
+
+
+From 8ea994e1f16f3ef5daa6ca85d52dd43a8f1fef42 Mon Sep 17 00:00:00 2001
+From: Minefiled <minefield@minefield.minefield>
+Date: Mon, 8 Feb 2021 11:25:10 +0100
+Subject: [PATCH 5/5] ..
+
+---
+ llvm/lib/Target/X86/X86FaultHardeningPass.cpp | 530 ++++++++----------
+ 1 file changed, 226 insertions(+), 304 deletions(-)
+
+diff --git a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+index 54a487607..57062d8dc 100644
+--- a/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
++++ b/llvm/lib/Target/X86/X86FaultHardeningPass.cpp
+@@ -50,23 +50,20 @@ using namespace llvm;
+ 
+ namespace {
+ 
+-constexpr bool BUILD_FOR_TESTING = false;
+-
+ // Commandline Options
+ 
+ // enable mitigation
+ static cl::opt<int> cl_percentage("fh-enable", cl::NotHidden, cl::desc(NAME ": enable fault hardening with percentage"),
+-                                  cl::init(BUILD_FOR_TESTING ? 100 : 0));
++                                  0));
+ 
+-static cl::opt<bool> cl_store("fh-store", cl::NotHidden, cl::desc(NAME ": place additional store after trap"));
++static cl::opt<bool> cl_store("fh-store", cl::NotHidden, cl::desc(NAME ":"));
+ 
+ static cl::opt<uint64_t> cl_factor("fh-factor", cl::NotHidden, cl::desc(NAME ": "), cl::init(0x11));
+ static cl::opt<uint64_t> cl_inverse("fh-inverse", cl::NotHidden, cl::desc(NAME ": "), cl::init(0x11));
+-static cl::opt<bool> cl_imm("fh-use-imm", cl::NotHidden, cl::desc(NAME ": "));
+-
++static cl::opt<bool>     cl_imm("fh-use-imm", cl::NotHidden, cl::desc(NAME ": "));
+ 
+ // handling
+-enum class MitigationType : int { INPLACE, STATIC, DYNBB, FREE, DOUBLEMUL, MODINV };
++enum class MitigationType : int { INPLACE, STATIC, DYNBB, FREE, DOUBLEMUL, MODINV, SEQMUL };
+ 
+ static cl::opt<MitigationType>
+     cl_type("fh-type", cl::desc(NAME ": choose mitigation type:"),
+@@ -75,39 +72,49 @@ static cl::opt<MitigationType>
+                        cl::OptionEnumValue { "dynbb", static_cast<int>(MitigationType::DYNBB), "" },
+                        cl::OptionEnumValue { "FREE", static_cast<int>(MitigationType::FREE), "" },
+                        cl::OptionEnumValue { "doublemul", static_cast<int>(MitigationType::DOUBLEMUL), "" },
+-                       cl::OptionEnumValue { "modinv", static_cast<int>(MitigationType::MODINV), "" }),
++                       cl::OptionEnumValue { "modinv", static_cast<int>(MitigationType::MODINV), "" },
++                       cl::OptionEnumValue { "seqmul", static_cast<int>(MitigationType::SEQMUL), "" }),
+             cl::init(MitigationType::DOUBLEMUL));
+ 
+ // trap type
+-enum class FaultTrapType : int { IMUL, SHL };
++enum class FaultTrapType : int { IMUL_IMM, IMUL_MEM, IMUL_REG };
++
++static cl::opt<FaultTrapType>
++    cl_trap_1("fh-imul1", cl::desc(NAME ": choose trap type:"),
++              cl::values(cl::OptionEnumValue { "imm", static_cast<int>(FaultTrapType::IMUL_IMM), "" },
++                         cl::OptionEnumValue { "mem", static_cast<int>(FaultTrapType::IMUL_MEM), "" },
++                         cl::OptionEnumValue { "reg", static_cast<int>(FaultTrapType::IMUL_REG), "" }),
++              cl::init(FaultTrapType::IMUL_IMM));
+ 
+ static cl::opt<FaultTrapType>
+-    cl_trap("fh-trap", cl::desc(NAME ": choose trap type:"),
+-            cl::values(cl::OptionEnumValue { "imul", static_cast<int>(FaultTrapType::IMUL), "trap type IMUL" },
+-                       cl::OptionEnumValue { "shl", static_cast<int>(FaultTrapType::SHL), "trap type SHL" }),
+-            cl::init(FaultTrapType::IMUL));
++    cl_trap_2("fh-imul2", cl::desc(NAME ": choose trap type:"),
++              cl::values(cl::OptionEnumValue { "imm", static_cast<int>(FaultTrapType::IMUL_IMM), "" },
++                         cl::OptionEnumValue { "mem", static_cast<int>(FaultTrapType::IMUL_MEM), "" },
++                         cl::OptionEnumValue { "reg", static_cast<int>(FaultTrapType::IMUL_REG), "" }),
++              cl::init(FaultTrapType::IMUL_REG));
++
++static cl::opt<bool> cl_use_rax("fh-use-rax", cl::NotHidden, cl::desc(NAME ": "));
++
++static cl::opt<uint64_t> cl_seed("fh-seed", cl::NotHidden, cl::desc(NAME ": "), cl::init(0xdeadbeaf));
+ 
+ // handling
+-enum class HandlingType : int { ABORT, COUNT, PENDING };
++enum class HandlingType : int { ABORT, COUNT, PENDING, STICKY };
+ 
+ static cl::opt<HandlingType> cl_handling(
+     "fh-handeling", cl::desc(NAME ": choose the behaviour when a fault ocurred:"),
+     cl::values(cl::OptionEnumValue { "abort", static_cast<int>(HandlingType::ABORT), NAME "call abort handler" },
+                // cl::OptionEnumValue { "mask", static_cast<int>(HandlingType::MASK), NAME "mask the bit flips" },
+                cl::OptionEnumValue { "count", static_cast<int>(HandlingType::COUNT), NAME "count the faults" },
+-               cl::OptionEnumValue { "pending", static_cast<int>(HandlingType::PENDING), NAME "mask the bit flips" }),
++               cl::OptionEnumValue { "pending", static_cast<int>(HandlingType::PENDING), NAME "mask the bit flips" },
++               cl::OptionEnumValue { "sticky", static_cast<int>(HandlingType::STICKY), NAME "mask the bit flips" }),
+     cl::init(HandlingType::PENDING));
+ 
+-// STATISTIC(HelloCounter, "Counts number of functions greeted");
+-
+ class FaultHardener {
+     Register REG;
+ 
+     uint64_t m_init;
+     uint64_t m_factor;
+ 
+-    FaultTrapType m_trap_type;
+-
+     MachineFunction &MF;
+ 
+     X86Subtarget const &   STI;
+@@ -127,10 +134,10 @@ class FaultHardener {
+     std::uniform_int_distribution<uint32_t> m_distribution;
+ 
+     void place_init(MachineBasicBlock &MBB, MachineInstr &MI);
++    void place_imul(MachineBasicBlock &MBB, MachineInstr &MI, FaultTrapType type, Register reg);
+     void place_trap(MachineBasicBlock &MBB, MachineInstr &MI);
+     void place_check(MachineBasicBlock &MBB, MachineInstr &MI);
+-    // void place_check(MachineFunction::iterator &MBBI, MachineBasicBlock::instr_iterator &MI, bool before);
+-
++   
+     std::pair<MachineBasicBlock *, MachineBasicBlock *> generate_if(unsigned cond, MachineBasicBlock::instr_iterator MI,
+                                                                     bool before);
+ 
+@@ -150,7 +157,6 @@ class FaultHardener {
+   public:
+     FaultHardener(MachineFunction &MF)
+       : REG { X86::R12 }
+-      , m_trap_type { cl_trap.getValue() }
+       , MF { MF }
+       , STI { MF.getSubtarget<X86Subtarget>() }
+       , TRI { *STI.getRegisterInfo() }
+@@ -160,18 +166,8 @@ class FaultHardener {
+       , m_generator {}
+       , m_distribution { 1, 100 } //
+     {
+-        switch ( m_trap_type ) {
+-            case FaultTrapType::IMUL: {
+-                m_init   = 0x1234567abff0000ull; // 0x5555555555555555ull;
+-                m_factor = 0x11;
+-                break;
+-            }
+-            case FaultTrapType::SHL: {
+-                m_init   = 5;
+-                m_factor = 0x0205070302060507ull;
+-                break;
+-            }
+-        }
++        m_init            = 0x1234567abff0000ull; // 0x5555555555555555ull;
++        m_factor          = 0x11;
+         m_constant_init   = generateConstant(m_init);
+         m_constant_factor = generateConstant(m_factor);
+ 
+@@ -179,7 +175,7 @@ class FaultHardener {
+         m_place_count      = p / 100;
+         m_place_percentage = p % 100;
+ 
+-        m_generator.seed(0xdeadbeaf);
++        m_generator.seed(cl_seed.getValue());
+     }
+ 
+     void harden_machine_function();
+@@ -248,31 +244,13 @@ static bool eflags_in_use(MachineInstr &MI) {
+ 
+ void FaultHardener::harden_machine_function() {
+     if ( !STI.is64Bit() ) {
+-         return;
+-    }
+-    /*struct MBBData {
+-        std::unorder_map<MachineBasicBlock*, uint64_t> m_values_at_jump;
+-        uint64_t m_last_reg_val;
+-    };*/ 
+-
+-    //std::unorder_map<MachineBasicBlock*, MBBData> lookup;
+-    
+-    if constexpr (BUILD_FOR_TESTING) {
+-
+-        // load the init value into the register
+-        BuildMI(*MF.begin(), *MF.begin()->begin(), {}, TII.get(X86::MOV64ri32)) //
+-            .addDef(X86::R14)
+-            .addImm(cl_factor.getValue());
+-
+-        BuildMI(*MF.begin(), *MF.begin()->begin(), {}, TII.get(X86::MOV64rr)) //
+-            .addReg(REG)
+-            .addReg(X86::R13);
++        return;
+     }
+ 
+     for ( MachineBasicBlock &MBB : MF ) {
+         bool do_place_init = true;
+-        
+-        //if (MBB.predecessors)
++
++        MachineInstr *MI_no_eflags = nullptr;
+ 
+         for ( MachineInstr &MI : MBB ) {
+             if ( MI.isMetaInstruction() ) {
+@@ -288,26 +266,29 @@ void FaultHardener::harden_machine_function() {
+ 
+                 for ( uint32_t i = 0; i < m_place_count; ++i ) {
+                     place_trap(MBB, MI);
+-                 } 
++                }
+ 
+                 if ( randomly_place_trap() ) {
+                     place_trap(MBB, MI);
+                 }
++
++                MI_no_eflags = &MI;
+             }
+-            
++
+             bool is_last = std::next(MI.getIterator()) == MBB.end();
+-            bool is_ctf = MI.isCall() || MI.isReturn() || MI.isBranch();
++            bool is_ctf  = MI.isCall() || MI.isReturn() || MI.isBranch();
+             if ( is_ctf || is_last ) {
+ 
+-                switch (cl_type.getValue()) {
+-                    case MitigationType::INPLACE: 
++                switch ( cl_type.getValue() ) {
++                    case MitigationType::INPLACE:
+                         break;
+ 
+                     case MitigationType::STATIC:
+-                        // ugliest hack of my live ... 
+-                        if (!is_ctf && is_last && MI.getOpcode() != X86::NOOP) {
++                        // ugliest hack of my live ...
++                        if ( !is_ctf && is_last && MI.getOpcode() != X86::NOOP ) {
+                             BuildMI(MBB, MBB.end(), {}, TII.get(X86::NOOP));
+-                        } else {
++                        }
++                        else {
+                             // check now since value cannot be determinded over jumps
+                             place_check(MBB, MI);
+                             do_place_init = MI.isCall();
+@@ -328,31 +309,27 @@ void FaultHardener::harden_machine_function() {
+                             m_trap_count = 0;
+                         }
+                         break;
+-                        
++
+                     case MitigationType::FREE:
+                         // no need check is done at beginning of BB
+                         break;
+-                }
+-            }
+-        }
+ 
+-        //lookup[&MBB].m_last_reg_val = m_REG_value;
+-    }
+-    if ( false ) {
+-        for ( auto MBBI = MF.begin(); MBBI != MF.end(); ++MBBI ) {
+-            errs() << MBBI->getName() << ":\n";
+-            for ( auto MI = MBBI->instr_begin(); MI != MBBI->instr_end(); ++MI ) {
+-                MI->print(errs());
+-                // errs() << "\n";
++                    case MitigationType::SEQMUL:
++                    case MitigationType::MODINV:
++                        if (m_trap_count % 2 == 1) {
++                            place_trap(MBB, *MI_no_eflags);
++                        }
++                        break;
++                }
+             }
+         }
+     }
+-    // MF.insert(MF.end(), AbortMBB);
+ }
+ 
+ void FaultHardener::place_init(MachineBasicBlock &MBB, MachineInstr &MI) {
+-    switch (cl_type.getValue()) {
++    switch ( cl_type.getValue() ) {
+         case MitigationType::INPLACE:
++        case MitigationType::FREE:
+             // doesn't use init
+             break;
+ 
+@@ -365,17 +342,9 @@ void FaultHardener::place_init(MachineBasicBlock &MBB, MachineInstr &MI) {
+             break;
+ 
+         case MitigationType::DYNBB:
+-            // in dynbb we palce checks at the beginning of basic blocks
+-            place_check(MBB, MI);
+-            m_trap_count = 0;
+-            break;
+-            
+-        case MitigationType::FREE:
+-            // doesn't use init
+-            break;
+-
+         case MitigationType::DOUBLEMUL:
+         case MitigationType::MODINV:
++        case MitigationType::SEQMUL:
+             // in dynbb we palce checks at the beginning of basic blocks
+             place_check(MBB, MI);
+             m_trap_count = 0;
+@@ -383,85 +352,108 @@ void FaultHardener::place_init(MachineBasicBlock &MBB, MachineInstr &MI) {
+     }
+ }
+ 
+-void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
++void FaultHardener::place_imul(MachineBasicBlock &MBB, MachineInstr &MI, FaultTrapType type, Register reg) {
++    switch ( type ) {
++        case FaultTrapType::IMUL_IMM: {
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
++                .addDef(reg)
++                .addReg(reg)
++                .addImm(cl_factor.getValue());
++            break;
++        }
++        case FaultTrapType::IMUL_MEM: {
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(reg)
++                .addReg(reg)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor");
++            break;
++        }
++        case FaultTrapType::IMUL_REG: {
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rr)) //
++                .addDef(reg)
++                .addReg(reg)
++                .addReg(X86::R14);
++            break;
++        }
++    }
++}
+ 
+-    /*bool eflags_used = eflags_in_use(MI);
+-    if ( eflags_used ) {
+-        BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
+-    }*/
++void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
+ 
+-    switch (cl_type.getValue()) {
++    switch ( cl_type.getValue() ) {
+         case MitigationType::INPLACE:
+             // REG = __fault_mul_checks[0] * 0x11
+             BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rmi8))
+-                .addDef(REG)                                // output = x * y
+-                .MIB_ADD_MEM_SYMBOL("__fault_mul_checks")    //
+-                .addImm(0x11);                             // y
++                .addDef(REG)                              // output = x * y
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_checks") //
++                .addImm(0x11);                            // y
+ 
+             place_check(MBB, MI);
+             break;
+ 
+         case MitigationType::STATIC:
+-            if (cl_imm) {
++            if ( cl_imm ) {
+                 /*if (cl_factor.getValue() < 256) {
+                     // REG = REG * 0x11
+                     BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
+                         .addDef(REG)
+                         .addReg(REG)
+                         .addImm(cl_factor.getValue());
+-                } else*/ {
++                } else*/
++                {
+                     // REG = REG * 0x11
+                     BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
+                         .addDef(REG)
+                         .addReg(REG)
+                         .addImm(cl_factor.getValue());
+                 }
+-            } else {
++            }
++            else {
+                 // REG = REG * __fault_mul_factor
+                 BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
+                     .addDef(REG)
+                     .addReg(REG)
+-                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor");
+             }
+             m_trap_count++;
+             break;
+ 
+         case MitigationType::DYNBB:
+-            //if (cl_imm) {
+-                /*if (cl_factor.getValue() < 256) {
+-                    // REG = REG * 0x11
+-                    BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
+-                        .addDef(REG)
+-                        .addReg(REG)
+-                        .addImm(cl_factor.getValue());
+-                } else*/ {
+-                    // REG = REG * 0x11
+-                    BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
+-                        .addDef(REG)
+-                        .addReg(REG)
+-                        .addImm(cl_factor.getValue());
+-                }
+-            //} else {
+-                // REG = REG * __fault_mul_factor
+-                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++            // if (cl_imm) {
++            /*if (cl_factor.getValue() < 256) {
++                // REG = REG * 0x11
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri8)) //
++                    .addDef(REG)
++                    .addReg(REG)
++                    .addImm(cl_factor.getValue());
++            } else*/
++            /*{
++                // REG = REG * 0x11
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
+                     .addDef(REG)
+                     .addReg(REG)
+-                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
+-            //}
++                    .addImm(cl_factor.getValue());
++            }
++            } else {*/
++            // REG = REG * __fault_mul_factor
++            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                .addDef(REG)
++                .addReg(REG)
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor");
++            /*}
+ 
+             BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rr)) //
+                 .addDef(REG)
+                 .addReg(REG)
+-                .addReg(X86::R14);
+-
++                .addReg(X86::R14);*/
+ 
+-             // R13b = R13b + 8
++            // R13b = R13b + 8
+             /*BuildMI(MBB, MI, {}, TII.get(X86::ADD64ri8))
+                 .addDef(X86::R13) // output = x * y
+                 .addReg(X86::R13)
+                 .addImm(8);*/
+ 
+-            m_trap_count+=3;
++            m_trap_count += 1;
+             break;
+ 
+         case MitigationType::FREE:
+@@ -469,7 +461,7 @@ void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
+             BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
+                 .addDef(REG)
+                 .addReg(REG)
+-                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor");
+ 
+             // R13b = R13b + 8
+             BuildMI(MBB, MI, {}, TII.get(X86::ADD8ri))
+@@ -478,59 +470,95 @@ void FaultHardener::place_trap(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .addImm(8);
+             break;
+ 
+-        case MitigationType::DOUBLEMUL:
+-            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
+-                .addReg(X86::R12)
+-                .addReg(X86::R12);*/
+-
+-            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64rr)) //
+-                .addReg(X86::RBX)
+-                .addReg(X86::R14)
+-                .addReg(X86::RBX)
+-                .addReg(X86::R14);*/
+-                
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rr)) //
+-                .addDef(X86::R12)
+-                .addReg(X86::R12)
+-                .addReg(X86::R14);
+-            
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rri32)) //
+-                .addDef(X86::R13)
+-                .addReg(X86::R13)
+-                .addImm(cl_factor.getValue());
++        case MitigationType::DOUBLEMUL: {
+ 
+-            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
+-                .addReg(X86::R12)
+-                .addReg(X86::R12);*/
++            Register reg = REG;
++            if ( cl_use_rax ) {
++                reg = X86::RAX;
++                BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                    .addReg(X86::R12)
++                    .addReg(X86::R12);
++            }
+ 
++            place_imul(MBB, MI, cl_trap_1.getValue(), reg);
++            place_imul(MBB, MI, cl_trap_2.getValue(), X86::R13);
+ 
+-            /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64rr)) //
+-                .addReg(X86::RBX)
+-                .addReg(X86::R14)
+-                .addReg(X86::RBX)
+-                .addReg(X86::R14);*/
+-        
++            if ( cl_use_rax ) {
++                BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                    .addReg(X86::R12)
++                    .addReg(X86::R12);
++            }
+             break;
++        }
+         case MitigationType::MODINV:
+-            BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
+-                .addReg(X86::R12)
+-                .addReg(X86::R12);
++        
++            if ( m_trap_count % 2 == 0 ) {
++                Register reg = X86::R13;
++                if ( cl_use_rax ) {
++                    reg = X86::RAX;
++                    BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                        .addReg(X86::R13)
++                        .addReg(X86::R13);
++                }
+ 
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
+-                .addDef(X86::RAX)
+-                .addReg(X86::RAX)
+-                .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                    .addDef(reg)
++                    .addReg(reg)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor");
++                    
++                if ( cl_use_rax ) {
++                    BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                        .addReg(X86::R13)
++                        .addReg(X86::R13);
++                }
++            }
++            else {
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                    .addDef(X86::R13)
++                    .addReg(X86::R13)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_inverse");
++                }
++            m_trap_count++;
++
++
++            break;
++
++        case MitigationType::SEQMUL: {
++
++            if ( m_trap_count % 2 == 0 ) {
++                Register reg = REG;
++                if ( cl_use_rax ) {
++                    reg = X86::RAX;
++                    BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                        .addReg(X86::R12)
++                        .addReg(X86::R12);
++                }
++
++                /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64rr)) //
++                    .addReg(reg)
++                    .addReg(X86::R13)
++                    .addReg(reg)
++                    .addReg(X86::R13);*/
++
++                place_imul(MBB, MI, cl_trap_1.getValue(), reg);
++                if ( cl_use_rax ) {
++                    BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
++                        .addReg(X86::R12)
++                        .addReg(X86::R12);
++                }
++            }
++            else {
++                place_imul(MBB, MI, cl_trap_2.getValue(), X86::R13);
++                /*BuildMI(MBB, MI, {}, TII.get(X86::XCHG64rr)) //
++                    .addReg(X86::R12)
++                    .addReg(X86::R13)
++                    .addReg(X86::R12)
++                    .addReg(X86::R13);*/
++            }
++            m_trap_count++;
+ 
+-            BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
+-                .addDef(X86::RAX)
+-                .addReg(X86::RAX)
+-                .MIB_ADD_MEM_SYMBOL("__fault_mul_inverse"); 
+-
+-            BuildMI(MBB, MI, {}, TII.get(X86::XCHG64ar)) //
+-                .addReg(X86::R12)
+-                .addReg(X86::R12);
+-                
+             break;
++        }
+     }
+ 
+     if ( cl_store ) {
+@@ -556,10 +584,10 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+     if ( eflags_used ) {
+         BuildMI(MBB, MI, {}, TII.get(X86::PUSHF64));
+     }
+-    
+-    switch (cl_type.getValue()) {
++
++    switch ( cl_type.getValue() ) {
+         case MitigationType::INPLACE:
+-            //EFLAGS = REG == __fault_checks[1]
++            // EFLAGS = REG == __fault_checks[1]
+             BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
+                 .addReg(REG)
+                 .addReg(X86::R13)
+@@ -570,7 +598,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+             break;
+ 
+         case MitigationType::STATIC:
+-            //EFLAGS = REG == __fault_checks[m_trap_count]
++            // EFLAGS = REG == __fault_checks[m_trap_count]
+             BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
+                 .addReg(REG)
+                 .addReg(X86::R13)
+@@ -597,7 +625,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .addReg(REG)
+                 .addReg(REG)
+                 .MIB_ADD_MEM_SYMBOL("__fault_mul_mask");
+-                
++
+             // EFLAGS = REG == *R13
+             BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
+                 .addReg(REG)
+@@ -607,22 +635,19 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .addImm(0) // disp
+                 .addReg(X86::NoRegister);
+             break;
+-        
++
+         case MitigationType::DOUBLEMUL:
++        case MitigationType::SEQMUL:
+ 
+             BuildMI(MBB, MI, {}, TII.get(X86::CMP64rr)) //
+                 .addReg(REG)
+                 .addReg(X86::R13);
+ 
+-            if constexpr (BUILD_FOR_TESTING) {
+-                MI.killsRegister(X86::R13);
+-            
+-            }
+             break;
+ 
+         case MitigationType::MODINV:
+             BuildMI(MBB, MI, {}, TII.get(X86::CMP64rm)) //
+-                .addReg(REG)
++                .addReg(X86::R13)
+                 .MIB_ADD_MEM_SYMBOL("__fault_mul_init");
+             break;
+     }
+@@ -655,13 +680,23 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 .MIB_ADD_MEM_SYMBOL("__fault_pending")
+                 .addImm(X86::COND_NE);
+             break;
++
++        case HandlingType::STICKY:
++            BuildMI(MBB, MI, {}, TII.get(X86::SETCCr)) //
++                .addDef(REG)
++                .addImm(X86::COND_NE);
++
++            BuildMI(MBB, MI, {}, TII.get(X86::OR8mr)) //
++                .MIB_ADD_MEM_SYMBOL("__fault_pending")
++                .addReg(REG);
++            break;
+     }
+ 
+     // restore correct state if not aborted
+-    if ( cl_handling.getValue() != HandlingType::ABORT) {
++    if ( cl_handling.getValue() != HandlingType::ABORT ) {
+         int64_t disp = 0;
+ 
+-        switch (cl_type.getValue()) {
++        switch ( cl_type.getValue() ) {
+             case MitigationType::INPLACE:
+                 // no need
+                 break;
+@@ -672,13 +707,13 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                     .addDef(X86::R13)
+                     .addReg(X86::R13)
+                     .addReg(X86::R13);*/
+-                
++
+                 BuildMI(MBB, MI, {}, TII.get(X86::LEA64r)) //
+                     .addReg(X86::R13)
+                     .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
+ 
+                 BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)) //
+-                    .addReg(X86::R12) 
++                    .addReg(X86::R12)
+                     .MIB_ADD_MEM_SYMBOL("__fault_mul_checks");
+ 
+                 break;
+@@ -689,7 +724,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+             case MitigationType::FREE:
+                 // EFLAGS = REG == *R13
+                 BuildMI(MBB, MI, {}, TII.get(X86::MOV64rm)) //
+-                    .addDef(X86::R12) 
++                    .addDef(X86::R12)
+                     .addReg(X86::R13)
+                     .addImm(1)
+                     .addReg(X86::NoRegister)
+@@ -698,6 +733,7 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 break;
+ 
+             case MitigationType::DOUBLEMUL:
++            case MitigationType::SEQMUL:
+ 
+                 BuildMI(MBB, MI, {}, TII.get(X86::MOV64rr)) //
+                     .addDef(REG)
+@@ -705,14 +741,14 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+                 break;
+ 
+             case MitigationType::MODINV:
+-                 BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
+-                    .addDef(REG)
+-                    .addReg(REG)
+-                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor"); 
++                BuildMI(MBB, MI, {}, TII.get(X86::IMUL64rm)) //
++                    .addDef(X86::R13)
++                    .addReg(X86::R13)
++                    .MIB_ADD_MEM_SYMBOL("__fault_mul_factor");
+ 
+                 BuildMI(MBB, MI, {}, TII.get(X86::MOV64mr)) //
+                     .MIB_ADD_MEM_SYMBOL("__fault_mul_init")
+-                    .addReg(REG);
++                    .addReg(X86::R13);
+                 break;
+         }
+     }
+@@ -720,120 +756,6 @@ void FaultHardener::place_check(MachineBasicBlock &MBB, MachineInstr &MI) {
+     if ( eflags_used ) {
+         BuildMI(MBB, MI, {}, TII.get(X86::POPF64));
+     }
+-
+-
+-#if 0
+-    if ( cl_mask ) {
+-        // MI = std::next(MI);
+-        // place_init_state(*MBBI, MI);
+-        return;
+-    }
+-    MachineBasicBlock &MBB         = *MBBI;
+-    DebugLoc           DL          = DebugLoc {}; // MI->getDebugLoc();
+-    bool               eflags_used = eflags_in_use(*MI);
+-
+-    MachineBasicBlock::instr_iterator where = before ? MI : std::next(MI);
+-
+-    // BuildMI(MBB, where, DL, TII.get(X86::NOOP));
+-
+-    BuildMI(MBB, where, DL, TII.get(X86::CALL64pcrel32)).addExternalSymbol("__fault_check");
+-
+-    // BuildMI(MBB, where, DL, TII.get(X86::CALL64r)).addReg(X86::RAX);
+-
+-    // set the iterator to the last instruction
+-    MI = std::next(MI);
+-
+-    return;
+-
+-    if ( eflags_used ) {
+-        BuildMI(MBB, where, DL, TII.get(X86::PUSHF64));
+-    }
+-
+-    BuildMI(MBB, where, DL, TII.get(X86::CMP64rm))
+-        .addReg(REG)                                          // x
+-        .MIB_ADD_MEM_CONSTANT(generateConstant(m_REG_value)); // y
+-
+-    BuildMI(MBB, MI, {}, TII.get(X86::JCC_1))
+-        .addExternalSymbol("__fault_abort") // target
+-        .addImm(X86::COND_NE);
+-    
+-
+-        if ( eflags_used ) {
+-        BuildMI(MBB, where, DL, TII.get(X86::POPF64));
+-    }
+-
+-
+-    BuildMI(MBB, where, DL, TII.get(X86::SETCCr))
+-        .addReg(REG)                                          // x
+-        .addImm(X86::COND_NE);
+-        
+-    BuildMI(MBB, where, DL, TII.get(X86::ADD64mr)) 
+-        .MIB_ADD_MEM_SYMBOL("__fault_count")
+-        .addReg(REG);
+-
+-
+-    if ( eflags_used ) {
+-        BuildMI(MBB, where, DL, TII.get(X86::POPF64));
+-    }
+-
+-    return;
+-#elif 0
+-
+-    // jump
+-    BuildMI(MBB, where, DL, TII.get(X86::JCC_1))
+-        .addExternalSymbol("__fault_abort") // target
+-        .addImm(X86::COND_NE);              // type
+-
+-    /*BuildMI(MBB, where, DL, TII.get(X86::CALL64pcrel32))
+-        .addExternalSymbol("__fault_abort");*/
+-
+-    if ( eflags_used ) {
+-        BuildMI(MBB, where, DL, TII.get(X86::POPF64));
+-    }
+-
+-    return;
+-
+-#elif 0
+-
+-#elif 0
+-
+-    __fault_checks
+-
+-        MachineBasicBlock *AfterMBB = generate_abort_jcc(MI, before, AbortMBB);
+-
+-    MI = AfterMBB->instr_begin();
+-
+-    if ( eflags_used ) {
+-        BuildMI(*AfterMBB, MI, DL, TII.get(X86::POPF64));
+-    }
+-    // place_init_state(*AfterMBB, MI);
+-    MBBI = AfterMBB->getIterator();
+-
+-#elif 0
+-    auto blocks   = generate_if(X86::COND_E, MI, before);
+-    auto ThenMBB  = blocks.first;
+-    auto AfterMBB = blocks.second;
+-
+-    // call
+-    // BuildMI(TakenMBB, DL, TII.get(X86::CALL64pcrel32))
+-    //    .addExternalSymbol("__abort"); // target
+-
+-    if ( cl_place_ud ) {
+-        BuildMI(ThenMBB, DL, TII.get(X86::TRAP));
+-    }
+-    else {
+-        BuildMI(ThenMBB, DL, TII.get(X86::INC64m)).MIB_ADD_MEM_SYMBOL("__fault_count"); // target
+-    }
+-    // BuildMI(ThenMBB, DL, TII.get(X86::JMP_1)).addMBB(AfterMBB);
+-
+-    MI = AfterMBB->instr_begin();
+-
+-    if ( eflags_used ) {
+-        BuildMI(*AfterMBB, MI, DL, TII.get(X86::POPF64));
+-    }
+-    // place_init_state(*AfterMBB, MI);
+-    MBBI = AfterMBB->getIterator();
+-#endif
+ }
+ 
+ std::pair<MachineBasicBlock *, MachineBasicBlock *>
+-- 
+2.25.1
+
