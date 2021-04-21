@@ -10,3 +10,6 @@ Then follow the build instructions from the SGX SDK version 2.10 [here](https://
 
 ## Proof of Concepts
 The folder `pocs` contains the example of the `imul` instruction in the `imul` folder and a template to build sgx enclaves in the `sgx-template` folder.
+
+## NOP Enclave
+The folder `nop-enclave` contains an example enclave larger than 128 MB to show the Linux SGX driver can swap code pages.
